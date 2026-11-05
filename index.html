@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fat Stacks</title>
+<link rel="stylesheet" href="ui/style.css">
+<link rel="stylesheet" href="ui/match.css">
+</head>
+<body>
+<header>
+  <h1>Fat Stacks <span id="regionName"></span></h1>
+  <div id="statusbar"></div>
+  <button id="helpBtn" class="helpbtn">How to play</button>
+</header>
+<main>
+  <section id="map"><div id="board" aria-label="Region map"></div></section>
+  <aside>
+    <div class="card" id="here"></div>
+    <div class="card" id="actions"></div>
+    <div class="card" id="caravan"></div>
+    <details class="card" id="worldCard"><summary><h2 id="worldTitle">World map</h2></summary><div id="worldMap"></div></details>
+    <details class="card log"><summary><h2>Journal</h2></summary><ol id="log"></ol></details>
+  </aside>
+</main>
+<div id="matchLayer" hidden></div>
+<div id="help" hidden>
+  <div class="helpbox">
+    <h2>How to play (Region 1 playtest)</h2>
+    <p><b>Goal:</b> reach the <b>Checkpoint</b> at the top of the map (stop 8) carrying what the guards demand this time (shown in the top bar from the start, e.g. Rank IX travel papers, settlers (Alsó), specialists (Felső), leaders (Király) or goods of one suit), counted across your cargo and personal deck, and get through the inspection with at least <b>8 cargo cards</b>.</p>
+    <p><b>Travel:</b> each turn you move one stop forward. Numbered markers on the map show where you can go; the same numbers appear on the route cards on the right (hover a card to see its road). Highways charge a toll on entry; you can pay any fee with coins or with one random cargo card. Grey <b>?</b> markers are places you haven't seen yet.</p>
+    <p><b>Settlements:</b> trade at the Market, upgrade cards at the Guild or Magistrate's Office, and sometimes play a Zsír match (optional). Every card your team captures in a match joins your cargo, win or lose.</p>
+    <p><b>Points of interest</b> (caves, ruins): no services, but a match there uses a richer deck. Your companion doesn't come along: you pick one of four deals within a few seconds, and a local who picks the same deal partners you. If nobody does, you choose from what the locals asked for.</p>
+    <p><b>Zsír:</b> the first card of a trick sets the rank. A card of that rank, or any VII, takes the trick; the last one played wins it. Click a card in your hand to play it; cards marked <i>takes</i> would win the trick. When play comes back to the player who led, they may continue with a card that takes it, or Pass. X and Ász are worth 10 points each.</p>
+    <p><b>Calls:</b> during a match you can call to your partner: <i>Add lard!</i> (throw an X or Ász onto a trick your side holds), <i>Don't add lard!</i>, <i>Hold!</i> (take the trick) and <i>Don't hold!</i>. They're requests: your partner follows when they can. A call lasts until the trick ends.</p>
+    <p><b>After a match:</b> you may move one captured card into your <b>personal deck</b> (your two extra cards in every match). Rank IX cards only give their passive bonuses from the personal deck.</p>
+    <p><b>Roads:</b> encounter points hold peddlers, inns, travellers, toll collectors and ambushes. In an ambush you first pick which cargo to put at risk: click whole rows of four before the countdown ends.</p>
+    <p><b>Checkpoint:</b> submitting is final. A suspicion of 11+ (mostly X and Ász cards) means an inspection; if contraband is found you Fight (a Zsír match played with your own cargo) or Surrender the cards found. You may go back once to the last highway settlement for 10 coins.</p>
+    <p><b>Attrition</b> (bought at a Church): a blessed card (↻) can be played <i>sideways</i> for its rank's effect: VII Draw Two, VIII Double Play, IX Rank Request, X Lock, Alsó Face-Card Request, Felső Suit Request, Király Cancel, Ász Skip. Effects hit the next player only. Click the card and choose.</p>
+    <p><b>Keys:</b> 1–9 choose a route; Esc closes this window. Settlement services (Market, Guild, Magistrates, Church) fold open and shut with a click on their title; click an upgrade's description to read it in full.</p>
+    <p><b>Marks:</b> ⚠ on a card = an ability not yet working in this build. ★ = fully upgraded.</p>
+    <p class="muted">Test build: values are provisional. Add <code>&amp;seed=N</code> to the address for a different run; <code>&amp;refs=1</code> shows rule references.</p>
+    <button class="primary" id="helpClose">Start playing</button>
+  </div>
+</div>
+<script type="module" src="ui/main.js"></script>
+</body>
+</html>
