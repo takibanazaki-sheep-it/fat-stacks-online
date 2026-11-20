@@ -53,7 +53,7 @@ async function host(Peer, opts, show) {
     broadcast({ t: "lobby", humans, code });
     const list = tag("ul"); humans.forEach((p, k) => list.append(tag("li", `${p.name} · ${p.civ}${k === 0 ? " (host)" : conns[k]?.open ? "" : " (disconnected)"}`)));
     const go = tag("button", humans.length < 2 ? "Waiting for at least one more player…" : `Start with ${humans.length} players`, "primary");
-    go.disabled = humans.length < 2; go.onclick = () => begin().catch((e) => show(tag("h2", "Couldn't start"), tag("p", e.message, "bad")));
+    go.disabled = humans.length < 2; go.onclick = () => { go.disabled = true; begin().catch((e) => { beginning = false; show(tag("h2", "Couldn't start"), tag("p", e.message, "bad")); }); };
     show(tag("h2", "Online game · you're hosting"), tag("p", "Room code:", "muted"), tag("div", code, "roomcode"),
       tag("p", "Other players open Fat Stacks, choose “Join an online game” in the hideout, and enter this code. Keep this tab open: your browser runs the game.", "muted small"),
       tag("h3", `Players (${humans.length} of 4)`), list,
@@ -61,7 +61,9 @@ async function host(Peer, opts, show) {
   };
   peer.on("connection", (c) => {
     c.on("data", (msg) => onGuest(c, msg));
-    c.on("close", () => { const k = conns.indexOf(c); if (k > 0) { conns[k] = null; if (!started) { humans.splice(k, 1); conns.splice(k, 1); } lobby(); notify("left"); } });
+    // a guest leaving: before the start, the lobby updates; after it, the seat waits for a rejoin and the game screen stays (the
+    // lobby, with its Start button, must never come back over a running game)
+    c.on("close", () => { const k = conns.indexOf(c); if (k > 0) { conns[k] = null; if (!started) { humans.splice(k, 1); conns.splice(k, 1); lobby(); } notify("left"); } });
   });
   function onGuest(c, msg) {
     if (msg.t === "hello") {
@@ -74,7 +76,7 @@ async function host(Peer, opts, show) {
       const civ = humans.some((p) => p.civ === msg.civ) ? ONLINE_CIVS.find((x) => !humans.some((p) => p.civ === x)) : msg.civ;
       humans.push({ civ, name: msg.name }); conns[humans.length - 1] = c;
       if (civ !== msg.civ) c.send({ t: "note", text: `${msg.civ} is taken: you play ${civ}.` });
-      return lobby();
+      return started ? undefined : lobby();
     }
     if (msg.t === "move" && started) {
       const seat = conns.indexOf(c); if (seat <= 0) return;
@@ -82,7 +84,10 @@ async function host(Peer, opts, show) {
       if (!r.ok) c.send({ t: "rejected", why: r.why });
     }
   }
+  let beginning = false;
   async function begin() {
+    if (started || beginning) return;   // one world per game: never generate a second (a double click, a stale lobby)
+    beginning = true;
     show(tag("h2", "Generating a new world…"), tag("p", "Your machine builds the world for everyone (about 10 seconds).", "muted"));
     const w = await opts.generate();
     Object.assign(files, await opts.fetchRegion(w, 1));

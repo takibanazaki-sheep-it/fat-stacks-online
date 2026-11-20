@@ -262,8 +262,7 @@ function withBikes(hand, acts) {
 function constrain(m, s, cards, req = null) {
   let out = cards;
   const narrow = (pred) => { const k = out.filter(pred); if (k.length) out = k; };
-  const stamp = (x) => (x.at ??= (m.cseq = (m.cseq || 0) + 1));
-  const live = [];
+  const live = [];   // pure: start times are stamped by act (stampEffects), never here, so asking what's legal changes nothing
   if (m.hearYe && m.hearYe.by !== s) live.push({ x: m.hearYe, scope: 3, apply: () => narrow((c) => c.suit === m.hearYe.suit) });   // every later player
   if (m.rightOfWay && m.rightOfWay.by !== s) live.push({ x: m.rightOfWay, scope: 1, apply: () => narrow((c) => c.suit !== m.rightOfWay.suit) });   // the next player
   if (m.lek && m.lek.seat === s) live.push({ x: m.lek, scope: 1, apply: () => narrow((c) => c.rank === "Ász") });   // Lekking (Túzok): the next player
@@ -271,8 +270,7 @@ function constrain(m, s, cards, req = null) {
     apply: () => { const top = Math.max(...out.map((c) => m.value(c))); narrow((c) => m.value(c) === top); } });
   // an Attrition request is one of these forced plays, binding one player (your answer, D-1247): ranked with them by D-522
   if (req) live.push({ x: req, scope: 1, apply: () => narrow((c) => complies(req, c)) });
-  for (const e of live) stamp(e.x);
-  live.sort((a, b) => b.scope - a.scope || a.x.at - b.x.at);
+  live.sort((a, b) => b.scope - a.scope || (a.x.at ?? 1e9) - (b.x.at ?? 1e9));
   // the stronger effect wins a conflict: a weaker one that would leave no card the stronger allows is dropped (narrow keeps out)
   for (const e of live) e.apply();
   return out;
@@ -310,7 +308,12 @@ function enterHands(m) {
   if (!m.onHand) return;
   for (let s = 0; s < 4; s++) for (const c of m.hands[s]) if (!c.entered) { c.entered = true; m.onHand(m, s, c); }
 }
-export function act(m, seat, action) { try { return actInner(m, seat, action); } finally { enterHands(m); } }
+/** forced-play effects get their start order when they begin, inside a move every copy applies alike (D-522; online copies must
+ *  never differ because one screen asked what was legal and another didn't, D-956) */
+function stampEffects(m) {
+  for (const x of [m.hearYe, m.rightOfWay, m.lek, m.intimidate, m.pending]) if (x && x.at == null) x.at = m.cseq = (m.cseq || 0) + 1;
+}
+export function act(m, seat, action) { try { return actInner(m, seat, action); } finally { enterHands(m); stampEffects(m); } }
 function actInner(m, seat, action) {
   const L = legal(m);
   if (seat !== L.seat) throw new Error(`not seat ${seat}'s turn`);
