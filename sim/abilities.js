@@ -1,7 +1,5 @@
-// Card abilities in the slice. Only upgraded cards have abilities (D-647). IMPLEMENTED: the cards in upgrades.js's subset
-// (Farmfolk IX, Clergy IX, Farmfolk VIII). NOT IMPLEMENTED (a known gap): the abilities of other upgraded cards that can
-// reach the player through Travelling Merchant, found treasure, the broken-down caravan or Feed the Masses (e.g. Clergy
-// VIII Second Chance, Tradesfolk VIII Merchant's Cut, a Farmfolk Conscript's capture, D-651); they behave as plain cards.
+// Card abilities. Only upgraded cards have abilities (D-647). Every main suit's line and the built alternative lines are
+// implemented; unbuiltAbilities() below names any upgraded card whose abilities aren't, so the interface can say so (D-871).
 import { RULES, PLACEHOLDER, ALL_SUITS } from "./rules.js";
 import { matchSay, card, claimOf } from "./zsir.js";
 import { COMMODITY_STAGES } from "./commodity-data.js";
@@ -40,8 +38,15 @@ export const highwayExempt = (caravan) => inPersonal(caravan, CLERGY_IX.highwayF
  *  Threshold-setting effects don't stack. */
 // Beast of Burden (Yearling, Grey Cattle in the personal deck): +4 cargo slots, not stacking (plainsfolk.md, D-375)
 export function capacity(caravan) {
-  return (inPersonal(caravan, FARMFOLK_IX.expandedCarryingCapacity) ? RULES.capacityFarmfolk : RULES.capacity) + (inPersonal(caravan, PLAINS.burden) ? 4 : 0)
-    + 8 * Math.min(2, caravan.personal.filter(RURAL.wandering).length);   // Wandering (rural Tradesfolk Ász; D-553, D-555, D-352)
+  // the wagon: 32 unlocked slots, plus slots bought at the Magistrates (D-394, D-553); the Peasant Wagon (Expanded Carrying Capacity)
+  // and the Cart's Wandering each give 8 more, and they don't stack: both are "hard set to 40", so owning both or several still
+  // gives +8 (D-555); prior unlocks push above 40 (D-553: 8 unlocked + the wagon = 48)
+  const wagon = inPersonal(caravan, FARMFOLK_IX.expandedCarryingCapacity) || caravan.personal.some(RURAL.wandering);
+  const base = RULES.capacity + (caravan.wagonSlots || 0) + (wagon ? RULES.capacityFarmfolk - RULES.capacity : 0) + (inPersonal(caravan, PLAINS.burden) ? 4 : 0);
+  // the vehicle stat cards (Corruption): 40 (Delivery Van) or 52 (Lorry) cart slots; reading: the larger of that and the usual
+  // capacity, not stacking (D-752, D-770, D-771; D-1186)
+  const vehicle = caravan.personal.some((x) => x.corr === "lorry") ? 52 : caravan.personal.some((x) => x.corr === "van") ? 40 : 0;
+  return Math.max(base, vehicle);
 }
 
 /** Ability hook for Zsír matches: called after every card play. */
@@ -90,12 +95,24 @@ const BANDIT = (c) => c.suit === "Bandits";
 
 export function onPlay(rng) {
   const run = cardAbilities(rng);
-  return (m, seat, c) => {
+  // Learning the Trade (D-532, D-534): the Felső is picked when the Merchant's Apprentice enters the hand, fixed while it's there.
+  // Pool: the suits of the encounter deck; at checkpoints the King's Men; in ambushes, duels and challenges the attacker's or
+  // challenger's base caravan identity (m.learnSuit)
+  const hook = (m, seat, c) => play(m, seat, c);
+  hook.onHand = (m, seat, c) => {
+    if (!RURAL.apprentice(c) || c.learnedSuit) return;
+    const suits = m.learnSuit ? [m.learnSuit] : m.kind === "checkpoint" ? ["King's Men"] : (m.suits || [...new Set(m.deck.map((x) => x.suit))]).filter((su) => su !== "Corruption");
+    if (!suits.length) return;
+    c.learnedSuit = rng.pick(suits);
+    if (seat === 0) matchSay(m, `Learning the Trade: your apprentice picks up the ways of a ${c.learnedSuit} Felső.`);
+  };
+  return hook;
+  function play(m, seat, c) {
     const st = m.trick.stack; let me = st[st.length - 1];
     const t = m.trick, g0 = m.generated.length, c0 = m.coins;
     // Fermentation (Grape Must 25 %, Barrelled Wine 50 %): the next player's chosen card may be swapped for a random card of
     // their hand (the chosen one included), which is played instead (D-561)
-    if (t.ferment && seat !== t.ferment.by) {
+    if (t.ferment && seat !== t.ferment.by && !me.horizontal) {   // a sideways play is a deliberate Attrition play: no slip (D-1229)
       const f = t.ferment; t.ferment = null;
       if (rng.next() < f.chance && m.hands[seat].length) {
         const pool = [me.card, ...m.hands[seat]], pick = choose(m, rng, pool, (x) => st.map((y) => (y === me ? { ...y, card: x } : y)));
@@ -117,7 +134,19 @@ export function onPlay(rng) {
     const below = st[st.length - 2];
     if (below && below.saddle) {
       below.saddle = false;
-      if (claimOf(st).index !== st.length - 1 && m.deck.length && !ALT.tools(me.card)) {
+      // ability-granted claim rights count (plainsfolk.md), though the card's ability won't resolve: the rights it would have on play
+      // are tried on a copy of its place in the stack (Lekking, Hostile Takeover, Home Advantage, Protection Racket, a pending
+      // Indulgence / Pay It Forward / Outfitting for its side, the Summoned Monster; D-1204)
+      const k = me.card, side2 = seat % 2, below2 = st[st.length - 2];
+      const grant = { ...me };
+      if (AGRI.greatBustard(k) && st[0] !== me) grant.claimRank = st[0].card.rank;
+      if (TRADES.magnate(k) && m.richer && m.richer(seat)) grant.claimRank = "VII";
+      if (TOWNS.established(k) && below2) grant.claimRank = below2.card.rank;
+      if (t.outfit && side2 === t.outfit.team && k.suit === "Hillfolk") grant.claimRank = "VII";
+      if (BANDITS.crimeLord(k) && st.filter((x) => x !== me && x.card.suit === "Bandits").length >= 2) grant.racket = true;
+      if ((t.indulge && side2 === t.indulge.team) || (t.forward && side2 === t.forward.team) || k.corr === "monster") grant.indulged = true;
+      const rights = claimOf([...st.slice(0, -1), grant]).index === st.length - 1;
+      if (!rights && m.deck.length && !ALT.tools(me.card)) {
         const idx = choose(m, rng, m.deck.map((_, i) => i), (i) => [...st.slice(0, -1), { seat, card: m.deck[i] }]);
         const r = m.deck.splice(idx, 1)[0]; st.pop(); toOrigin(m, me.card);
         me = { seat, card: r }; st.push(me); c = r;
@@ -134,6 +163,22 @@ export function onPlay(rng) {
       if (me.disguise.hidden) { const i = m.log.length - 1; if (i >= 0) m.log[i] = `${m.names[seat]} plays what looks like the ${me.disguise.rank} of ${me.disguise.suit} (Tall Tales).`; }
     }
     me.round = t.rounds || 1;
+    if (c.corr && !me.horizontal) corruptionOnPlay(m, seat, c, me, before, run);
+    // Pay It Forward (Wayfarer): its claim passes to the next card its side plays this trick, which takes it when played even if
+    // an opponent took it in between; with no such card the transfer lapses at the trick's end. Good Samaritan: if an opponent
+    // stole it, that opponent's hand is filled with random basic VIII commodities, any suit, every empty place (D-565 to D-567)
+    if (t.forward && seat % 2 === t.forward.team && me.card !== t.forward.card && !me.horizontal) {
+      const f = t.forward; t.forward = null; me.indulged = true;
+      matchSay(m, `Pay It Forward: ${m.names[seat]} ${seat === 0 ? "take" : "takes"} up the claim.`);
+      if (f.samaritan && before && before.team !== seat % 2 && m.hands[before.seat]) {
+        const h = m.hands[before.seat], pool = COMMODITY_STAGES.filter((x) => x.rank === "VIII" && x.stage === 0 && x.roster !== "secret alternative"); let n = 0;
+        const add = (origin) => { const v = pool[Math.floor(rng.next() * pool.length)]; h.push(card("VIII", v.suit, { origin, generated: true, gift: true, name: v.name, ...(v.roster !== "main" ? { roster: v.roster } : {}) })); n++; };
+        while (h.filter((x) => x.origin === "pers").length < 2) add("pers");
+        while (h.filter((x) => x.origin === "enc").length < 4) add("enc");
+        if (n) matchSay(m, `Good Samaritan: ${m.names[before.seat]}'s hand fills with ${n} gifts of goods (a hand clog).`);
+      }
+    }
+    if (ALT_CLERGY.wayfarer(c) && !me.horizontal) { const cl = claimOf(st); if (cl && st[cl.index] === me) t.forward = { team: seat % 2, card: c, samaritan: ALT_CLERGY.samaritan(c) }; }   // Corruption cards (D-771, D-775, D-777; D-1186)
     if (isMerc(me.card, 2) && once(m, "impersonate", me.card)) impersonate(m, me, rng);   // before its (borrowed) abilities run
     if (isMerc(me.card, 3) && m.hands && m.deck && once(m, "recruits", me.card)) freshRecruits(m, rng);
     // Outfitting: the next allied Hillfolk card claims as a Seven
@@ -146,7 +191,12 @@ export function onPlay(rng) {
     else if (saltedFirst) { /* Refined Salt: salted before its ability, which doesn't trigger */ }
     else if (prev && prev.sleepy && !prev.based && !prev.silenced) { prev.sleepy = false; matchSay(m, "Sleepy: the card nods off on the feathers; its ability doesn't trigger."); }
     else if (prev && prev.lawNext) { prev.lawNext = false; me.suppressed = true; me.based = true; matchSay(m, "Law of the Land: this card plays as its plain base version."); }
+    // once per encounter (D-058, D-313): a card played again in the same encounter (Great Escape back to the hand) doesn't use its
+    // play ability again; going back to its deck of origin (Resurrection, a returned personal card) resets it (D-1214)
+    else if (me.horizontal) { /* an Attrition play: the card's own trick ability doesn't fire (D-101) */ }
+    else if (c.id != null && m.playUsed?.has(c.id)) matchSay(m, "The card has already used its play ability this encounter.");
     else {
+      if (c.id != null) (m.playUsed ??= new Set()).add(c.id);
       // To Arms! (Salvaged Weapons: the next allied face card; Surplus Arms: the next allied card) gains the Conscript ability
       // to the end of the trick; a second grant adds nothing (D-631)
       if (t.toArms && seat % 2 === t.toArms.team && me.card !== t.toArms.card && (!t.toArms.face || ["Alsó", "Felső", "Király", "Ász"].includes(me.card.rank))) {
@@ -179,7 +229,7 @@ export function onPlay(rng) {
     // ability; once per encounter
     const face = (x) => ["Alsó", "Felső", "Király", "Ász"].includes(x.rank);
     if (prev && !prev.based && !prev.horizontal && CARNIVAL.puppeteer(prev.card) && face(me.card) && me.card.suit !== prev.card.suit
-        && st.includes(prev) && !frozen(st, prev) && !(prev === st[0] && insulated(prev)) && once(m, "upstage", prev.card)) {
+        && st.includes(prev) && !frozen(st, prev) && !bound(st, prev, true) && !(PLAINS.stubborn(prev.card) && !prev.horizontal) && !(prev === st[0] && insulated(prev)) && once(m, "upstage", prev.card)) {
       st.splice(st.indexOf(prev), 1); st.push(prev); matchSay(m, "Upstage! The Puppeteer steals the show and moves to the top.");
     }
     // Juggling Act (Juggler): when the three cards directly above him make, with him, four different suits, those three rotate
@@ -193,7 +243,7 @@ export function onPlay(rng) {
         const rot = (n) => { const t3 = three.slice(); for (let k = 0; k < n; k++) t3.unshift(t3.pop()); return t3; };
         const turns = choose(m, rng, [2, 3, 4], (n) => [...st.slice(0, i + 1), ...rot(n), ...st.slice(i + 4)]);
         for (let k = 0; k < turns; k++) three.unshift(three.pop());
-        if (three.some((x) => frozen(st, x))) continue;
+        if (three.some((x) => !movable(st, x))) continue;   // Dead Weight, Entanglement, Stubborn as an Ox, Insulation (D-625, D-593, D-656; D-1204)
         st.splice(i + 1, 3, ...three); matchSay(m, `Juggling Act: the three cards above the Juggler spin ${turns} times.`);
       }
     }
@@ -211,7 +261,7 @@ export function onPlay(rng) {
     const top = st[st.length - 1];
     const trigger = (law) => BANDIT(top.card) || (law.card.refined >= 1 && top.card.suit === "Plainsfolk" && top.card.rank === "Ász" && (top.card.refined || 0) >= 2);
     for (const law of st.filter((x) => x !== top && !x.horizontal && !x.based && PLAINS.dogged(x.card) && !x.pursued && trigger(x))) {
-      if ((law === st[0] && insulated(law)) || frozen(st, law)) continue;
+      if ((law === st[0] && insulated(law)) || frozen(st, law) || bound(st, law, true)) continue;
       law.pursued = true; st.splice(st.indexOf(law), 1); st.push(law);
       matchSay(m, "Hot Pursuit: the Lawman rides to the top of the trick.");
     }
@@ -220,7 +270,10 @@ export function onPlay(rng) {
     // Slippery: the first card on the Loach, after its ability, 30 % slips to a random place between the Loach and the card to match
     if (prev && prev.slippy && st.includes(me) && st.includes(prev)) {
       prev.slippy = false; const lo = st.indexOf(prev);
-      if (lo >= 1 && movable(st, me) && rng.next() < 0.3) { st.splice(st.indexOf(me), 1); const pos = 1 + Math.floor(rng.next() * lo); st.splice(pos, 0, me); matchSay(m, "Slippery: the card slides down among the loaches."); }
+      // the slip position is a random selection, so Weighted Odds can lean it (D-602; D-1204)
+      if (lo >= 1 && movable(st, me) && rng.next() < 0.3) { const rest = st.filter((x) => x !== me), opts = Array.from({ length: lo }, (_, k) => 1 + k);
+        const pos = choose(m, rng, opts, (p2) => { const t2 = rest.slice(); t2.splice(p2, 0, me); return t2; });
+        st.splice(st.indexOf(me), 1); st.splice(pos, 0, me); matchSay(m, "Slippery: the card slides down among the loaches."); }
     }
     // the summoned Tusker's Rampage (Alluring Scent)
     if (t.tuskerRampage) { t.tuskerRampage = false; const tk = st.find((x) => x.neutral); if (tk) beastsOnPlay(m, -1, tk.card, tk, rng, () => {}); }
@@ -232,17 +285,23 @@ export function onPlay(rng) {
     if (t.lost && t.lost.entry !== (claimOf(st) ? st[claimOf(st).index] : null)) t.lost = null;
     if (t.disconcert && st.includes(me)) disconcert(m, me, rng);
     if (st.includes(me) && m.hands) { vengeful(m, seat, me, heldBy, rng); profiteer(m, seat, rng); }
+    // a Royal Mistress distracts the card played on her: its lingering and pending effects set this play don't take hold either
+    // (D-885, D-895 (14); D-1204)
+    if (me.distracted) { me.tallTales = me.noFunny = me.ward = me.lawNext = me.saddle = false;
+      if (t.anotherRound === seat) t.anotherRound = null;
+      if (t.mesmer?.card === me.card) t.mesmer = null; if (t.councillor?.card === me.card) t.councillor = null; }
     afterPlay(m, seat, me, heldBy);
     // a shared match (D-914): what seat 2's own abilities gain belongs to that seat's owner, not to you (it isn't your companion)
     if ((m.shared || m.mercHalf) && seat === 2) { (m.sideGains ??= { generated: [], coins: 0 }).generated.push(...m.generated.splice(g0)); m.sideGains.coins += m.coins - c0; m.coins = c0; }
-  };
+  }
 }
 function cardAbilities(rng) {
   const self = (m, seat, c, entry) => {
     // Bull Toss (D-249): a Seven played directly on top of a Headstrong Farmfolk X swaps places with it; if the X was the
     // bottom card, the Seven becomes the card to match (D-206)
     const st = m.trick.stack, n = st.length;
-    if (c.rank === "VII" && n >= 2 && FARMFOLK.headstrong(st[n - 2].card) && !st[n - 2].horizontal && !frozen(st, st[n - 2]) && !(n === 2 && insulated(st[0]))) {
+    // an active Magnate counts as a Seven for this too (Hostile Takeover, wealth checked on play; D-190 (2), D-1202)
+    if ((c.rank === "VII" || (TRADES.magnate(c) && m.richer && m.richer(seat))) && n >= 2 && FARMFOLK.headstrong(st[n - 2].card) && !st[n - 2].horizontal && !st[n - 2].based && !st[n - 2].suppressed && !st[n - 2].silenced && !frozen(st, st[n - 2]) && !bound(st, st[n - 2], true) && !bound(st, st[n - 1], true) && !(n === 2 && insulated(st[0]))) {
       [st[n - 2], st[n - 1]] = [st[n - 1], st[n - 2]];
       matchSay(m, `Bull Toss! The Seven is tossed under the ${st[n - 1].card.name || "Farmfolk X"}.`);
     }
@@ -253,7 +312,9 @@ function cardAbilities(rng) {
     if (FARMFOLK_IX.travellingMerchant(c) && seat % 2 === 1) matchSay(m, "Travelling Merchant: played by the other side; the benefit is theirs (D-267).");
     else if (FARMFOLK_IX.travellingMerchant(c)) {
       if (rng.next() < 0.5) {
-        const g = { rank: "VIII", suit: rng.pick(ALL_SUITS), refined: 1 };
+        // a Refinement I VIII of any suit, from every commodity type, alternatives included (D-245, D-353, D-487; D-1204)
+        const vs = COMMODITY_STAGES.filter((x) => x.rank === "VIII" && x.stage === 1 && x.roster !== "secret alternative"), v = vs[Math.floor(rng.next() * vs.length)];
+        const g = v ? { rank: "VIII", suit: v.suit, refined: 1, name: v.name, ...(v.roster !== "main" ? { roster: v.roster } : {}) } : { rank: "VIII", suit: rng.pick(ALL_SUITS), refined: 1 };
         m.generated.push(g);
         matchSay(m, `Travelling Merchant: a ${g.suit} VIII commodity (Refinement I) joins your cargo after the match.`);
       } else matchSay(m, "Travelling Merchant: no luck this time (50%).");
@@ -261,12 +322,12 @@ function cardAbilities(rng) {
     // Fanatic (Clergy VII): one other non-Clergy Seven in the trick becomes Clergy; an encounter card for good, a personal
     // card only until the trick ends. Checked whenever a Seven or the Fanatic is played (once per Fanatic).
     if (c.rank === "VII") {
-      const fan = st.find((x) => !x.horizontal && CLERGY.fanatic(x.card) && !x.fanaticUsed);
+      const fan = st.find((x) => !x.horizontal && !x.based && !x.suppressed && !x.silenced && CLERGY.fanatic(x.card) && !x.fanaticUsed);   // a card without its abilities doesn't act (D-1204)
       const target = fan && st.find((x) => x !== fan && x.card.rank === "VII" && x.card.suit !== "Clergy");
       if (target && ((target === st[0] && insulated(target)) || frozen(st, target))) fan.fanaticUsed = true;
       else if (target) { fan.fanaticUsed = true; if (target.card.origin === "pers") target.revertSuit = target.card.suit;
         else if (target.card.ref) target.card.ref.suit = "Clergy";
-        target.card.suit = "Clergy"; matchSay(m, "Fanatic: a Seven in the trick turns to Clergy."); }
+        setSuit(target.card, "Clergy"); matchSay(m, "Fanatic: a Seven in the trick turns to Clergy."); }   // setSuit keeps the stage and renames (D-385)
     }
     // Second Chance (Clergy VIII, refined; D-242, D-268): 25 % (Potent Medicines 50 %) to copy a random card of the previous
     // trick as a basic card placed directly above; it counts as played; its claim belongs to the copied card's player
@@ -285,6 +346,13 @@ function cardAbilities(rng) {
       m.hands[seat].push(card(copy.rank, copy.suit, { ...copy, origin: "pers", echo: true }));
       matchSay(m, `Echo of Fate: ${m.names[seat]} ${seat === 0 ? "get" : "gets"} a ${c.refined >= 2 ? "perfect" : "basic"} copy of the ${b.rank} of ${b.suit}.`);
     }
+    // Transcription (Scribe): played on another card, a transient basic copy of the card directly beneath comes to the hand,
+    // taking the place the Scribe left; fails when the Scribe leads (D-568, D-569)
+    if (ALT_CLERGY.scribe(c) && !m.retrigger) {
+      const i = st.indexOf(entry || st[st.length - 1]), b = i > 0 ? st[i - 1].card : null;
+      if (b) { m.hands[seat].push(card(b.rank, b.suit, { origin: c.origin || "pers", echo: true, ...(b.roster && b.roster !== "main" ? { roster: b.roster } : {}) }));
+        matchSay(m, `Transcription: ${m.names[seat]} ${seat === 0 ? "copy" : "copies"} the ${b.rank} of ${b.suit} into hand.`); }
+    }
     const me = entry || st[st.length - 1];
     // Gilded Bait (Tradesfolk X, refined): its value in coins (Amulet twice) goes to the side that takes the trick
     if (TRADES.bait(c)) { me.bait = (m.value ? m.value(c) : 0) * (c.refined >= 2 ? 2 : 1); matchSay(m, `Gilded Bait: ${me.bait} coins wait for whoever takes this trick.`); }
@@ -294,9 +362,13 @@ function cardAbilities(rng) {
       if (rng.next() < 0.5) {
         for (const x of st.filter((y) => y.card.rank === "VIII")) {
           if ((x === st[0] && insulated(x)) || frozen(st, x)) continue;
-          const to = rng.pick(SUITS12);
-          if (x.card.origin === "pers") { x.revertSuit = x.revertSuit || x.card.suit; x.revertName = x.revertName ?? x.card.name; }
-          setSuit(x.card, to); if (x.card.ref && x.card.origin === "enc") setSuit(x.card.ref, to);
+          // another suit's good: never its own suit; any of that suit's VIII versions, alternatives included (D-487; D-1204)
+          const to = rng.pick(SUITS12.filter((su) => su !== x.card.suit));
+          if (x.card.origin === "pers") { x.revertSuit = x.revertSuit || x.card.suit; x.revertName = x.revertName ?? x.card.name; x.revertRoster = x.revertRoster ?? x.card.roster; }
+          const vs = COMMODITY_STAGES.filter((v) => v.suit === to && v.rank === "VIII" && (v.roster === "main" || v.roster === "alternative") && v.stage === Math.min(2, x.card.refined || 0));
+          const v = vs.length ? vs[Math.floor(rng.next() * vs.length)] : null;
+          const apply = (k) => { setSuit(k, to); if (v) { k.roster = v.roster; k.name = v.name; } };
+          apply(x.card); if (x.card.ref && x.card.origin === "enc") apply(x.card.ref);
         }
         matchSay(m, "Commodity Exchange: the goods in the trick change hands, and suits.");
       } else matchSay(m, "Commodity Exchange: no effect this time.");
@@ -307,8 +379,9 @@ function cardAbilities(rng) {
       // lingering = claims, protections, Lock, blocks (TRK-23): ability claims (Herd Guard, Superior Equipment, Authority,
       // Conscript, Racket, Home Advantage, Make-Believe) via the suppressed flag; Insulation; pending next-card effects; the
       // play restrictions set by cards beneath (Hear Ye!, Right of Way, Intimidation)
-      for (const x of st) if (x !== me) { x.suppressed = true; x.insulated = false; x.lawNext = x.noFunny = x.saddle = x.tallTales = false; }
+      for (const x of st) if (x !== me) { x.suppressed = true; x.insulated = false; x.lawNext = x.noFunny = x.saddle = x.tallTales = x.ward = false; }
       m.trick.lock = null; m.hearYe = null; m.rightOfWay = null; m.intimidate = null;
+      m.trick.councillor = null; m.trick.mesmer = null; m.trick.anotherRound = null;   // pending effects count as lingering (D-895 (14); D-1204)
       if (c.refined >= 2) me.mistress = true;
       matchSay(m, "Distraction: the cards beneath lose their lasting effects.");
     }
@@ -342,10 +415,10 @@ function cardAbilities(rng) {
     // Roundup (Gulyás): every VIII and X already in the stack gathers, in order, directly beneath the Gulyás; the bottom card
     // (the capture target, D-051, D-189, R-58) never moves; a Stubborn X stays put; claims are recalculated
     if (PLAINS.gulyas(c)) {
-      const move = st.filter((x, i) => i > 0 && i < st.length - 1 && (x.card.rank === "VIII" || x.card.rank === "X") && !(PLAINS.stubborn(x.card) && !x.horizontal) && !ALT.tools(x.card) && !frozen(st, x));
+      const move = st.filter((x, i) => i > 0 && i < st.length - 1 && (x.card.rank === "VIII" || x.card.rank === "X") && !(PLAINS.stubborn(x.card) && !x.horizontal) && !ALT.tools(x.card) && !frozen(st, x) && !bound(st, x, true));
       if (move.length) { for (const x of move) st.splice(st.indexOf(x), 1); st.splice(st.length - 1, 0, ...move); matchSay(m, `Roundup: ${move.length} commodit${move.length === 1 ? "y gathers" : "ies gather"} beneath the Gulyás.`); }
     }
-    if (st.length >= 2 && st[st.length - 2].mistress && st[st.length - 1] === me) { me.suppressed = true; matchSay(m, "Distraction: the Royal Mistress distracts the card on top of her."); }
+    if (st.length >= 2 && st[st.length - 2].mistress && st[st.length - 1] === me) { me.suppressed = true; me.distracted = true; matchSay(m, "Distraction: the Royal Mistress distracts the card on top of her."); }
     altOnPlay(m, seat, c, me, rng, self);
     townsfolkOnPlay(m, seat, c, me, rng, self);
     carnivalOnPlay(m, seat, c, me, rng);
@@ -444,6 +517,31 @@ function beastsOnPlay(m, seat, c, me, rng, run) {
 
 // ---- Bandits (thug.md)
 // a temporary change of identity on a stack entry, undone when the trick ends (D-200 cleanup)
+// Corruption cards in play: the Joker becomes the last played card, the Blank Spare Card the capture target (copied play abilities
+// fire, reverting at the end of the trick as Cheap Imitation, D-637); Black Peter, played while your team holds the claim, gives
+// it to the last card the other team played (a kept claim against the cards now in the trick); the Generic Energy Card makes the
+// next Corruption card your team plays in the trick trigger its on-play effect twice (D-634's doubling; a copy made twice is the
+// same copy, so for these cards it changes nothing: reading)
+function corruptionOnPlay(m, seat, c, me, before, run) {
+  const st = m.trick.stack, t = m.trick;
+  if (c.corr === "monster") { me.indulged = true; matchSay(m, "Summoned Monster: it takes the claim, whatever the rank."); return; }   // upright (D-1190)
+  if (c.corr === "energy") { t.energy = seat % 2; matchSay(m, "Generic Energy Card: the next Corruption card your side plays fires twice."); return; }
+  const twice = t.energy === seat % 2; if (twice) t.energy = null;
+  if (c.corr === "joker" || c.corr === "blank") {
+    const tgt = c.corr === "joker" ? st[st.indexOf(me) - 1] : bottomTarget(st);
+    if (!tgt || tgt === me || m.retrigger) return;
+    const b = tgt.card, id = c.corr, was = c.name; remember(me); me.saved.corr = id;   // restored at the end of the trick
+    for (const k of ["suit", "rank", "refined", "adjective", "name", "roster"]) { if (b[k] === undefined) delete c[k]; else c[k] = b[k]; }
+    delete c.corr;
+    matchSay(m, `${was}: it becomes ${c.name || c.rank + " of " + c.suit} until the end of the trick${twice ? " (Energy: twice, the same copy)" : ""}.`);
+    m.retrigger = true; try { run(m, seat, c, me); } finally { m.retrigger = false; }
+    return;
+  }
+  if (c.corr === "peter" && before && before.team === seat % 2) {
+    const tgt = [...st].reverse().find((x) => x !== me && x.seat % 2 !== seat % 2 && !x.tower && !x.inserted);
+    if (tgt) { tgt.keep = new Set(st); matchSay(m, `Black Peter: the claim passes to ${m.names[tgt.seat]}'s ${tgt.card.name || tgt.card.rank + " of " + tgt.card.suit}.`); }
+  }
+}
 function remember(x) { if (!x.saved) x.saved = { suit: x.card.suit, rank: x.card.rank, refined: x.card.refined, adjective: x.card.adjective, name: x.card.name, roster: x.card.roster, cutPct: x.card.cutPct }; }
 export function restoreIdentities(stack) {
   for (const x of stack) if (x.saved) { for (const [k, v] of Object.entries(x.saved)) { if (v === undefined) delete x.card[k]; else x.card[k] = v; } delete x.saved; }
@@ -488,7 +586,7 @@ function banditsOnPlay(m, seat, c, me, rng, run) {
   // Sleight of Hand (Devious Bandits Alsó): once, on entering a trick with no Seven in it, one random card (any) moves to a
   // random position
   if (BANDITS.devious(c) && !st.some((x) => x.card.rank === "VII") && st.length >= 2 && once(m, "sleight", c)) {
-    const cards = st.filter((y) => !(y === st[0] && y.insulated) && !(PLAINS.stubborn(y.card) && !y.horizontal) && !ALT.tools(y.card) && !frozen(st, y));
+    const cards = st.filter((y) => !(y === st[0] && y.insulated) && !(PLAINS.stubborn(y.card) && !y.horizontal) && !ALT.tools(y.card) && !frozen(st, y) && !bound(st, y, true));
     const moves = cards.flatMap((y) => Array.from({ length: st.length }, (_, p) => [y, p])).filter(([y, p]) => { const o = st.filter((z) => z !== y); o.splice(p, 0, y); return o.every((z, k) => !frozen(st, z) || st.indexOf(z) === k); });
     const mv = moves.length ? choose(m, rng, moves, ([y, p]) => { const out = st.filter((z) => z !== y); out.splice(p, 0, y); return out; }) : null;
     const x = mv && mv[0];
@@ -500,11 +598,11 @@ function banditsOnPlay(m, seat, c, me, rng, run) {
   // Pillage (Reaver): steals one random capturable card from the trick at once, whoever wins; the loot is the Pillager's
   // alone (D-191, D-212); a personal card is copied as loot and follows its own return rules
   if (BANDITS.reaver(c)) {
-    const el = st.filter((x) => x !== me && !x.tower && !ALT.tools(x.card) && !frozen(st, x) && canInsert(st, st.indexOf(x)));   // Tools untargetable (D-641); Dead Weight
+    const el = st.filter((x) => x !== me && !x.tower && !ALT.tools(x.card) && !frozen(st, x) && canInsert(st, st.indexOf(x)) && !bound(st, x) && !(x === st[0] && x.insulated));   // Tools untargetable (D-641); Dead Weight; Entanglement; Insulation (D-1204)
     if (el.length) { const x = choose(m, rng, el, (y) => st.filter((z) => z !== y)); st.splice(st.indexOf(x), 1);
       const loot = x.card.origin === "pers" ? card(x.card.rank, x.card.suit, { ...x.card, origin: "enc", generated: true, id: undefined }) : x.card;
       if (x.card.origin === "pers") (m.returned ??= []).push(x.card);
-      m.captured[seat % 2].push(loot); matchSay(m, `Pillage: ${m.names[seat]} grab${seat === 0 ? "" : "s"} the ${loot.rank} of ${loot.suit} from the trick.`); }
+      spoil(m, seat, [loot]); (m.trick.pillaged ??= []).push(loot); matchSay(m, `Pillage: ${m.names[seat]} grab${seat === 0 ? "" : "s"} the ${loot.rank} of ${loot.suit} from the trick.`); }
   }
   // Theft (Robber; Zsivány also a 25 % payout of their combined value): every player loses one random hand card into the
   // trick directly above, in play order; not played (no abilities), they keep their claim rights; once per encounter
@@ -546,7 +644,7 @@ function altOnPlay(m, seat, c, me, rng, run) {
     } else matchSay(m, "The horse finds too few cards to bring in.");
   }
   // Weighted Odds (Engraved 5 %, Loaded 10 %): the later-played dice decide (D-602)
-  if (ALT.dice(c) && r >= 1 && once(m, "odds", c)) m.trick.weighted = { team: seat % 2, chance: r >= 2 ? 0.1 : 0.05 };
+  if (ALT.dice(c) && r >= 1 && once(m, "odds", c)) m.trick.weighted = { team: seat % 2, chance: r >= 2 ? 0.1 : 0.05, card: c };
   // Calling the Dance (Lute: Alsó, Felső, Király; Harp: Ász too): those cards of the encounter deck, shuffled, go to its top (D-604)
   if (ALT.koboz(c) && r >= 1 && once(m, "dance", c)) {
     const ranks = r >= 2 ? ["Alsó", "Felső", "Király", "Ász"] : ["Alsó", "Felső", "Király"];
@@ -651,15 +749,14 @@ function ruralOnPlay(m, seat, c, me, rng, run) {
     if (r >= 2) { m.retrigger = true; try { run(m, seat, c, me); } finally { m.retrigger = false; } }
   }
   // Learning the Trade (Merchant's Apprentice): a random Felső of the encounter's suits (checkpoints: King's Men) lends its trick
-  // ability at the Alsó's own level; claims stay the Alsó's (D-532, D-534, D-366). Reading: the ability works as played, then
-  // the card is the Alsó again, so Felső abilities that act at the trick's end don't carry over
-  if (RURAL.apprentice(c) && !m.retrigger && !frozen(st, me) && once(m, "learn", c)) {
-    const suits = m.kind === "checkpoint" ? ["King's Men"] : (m.suits || [...new Set(m.deck.map((x) => x.suit))]);
-    if (suits.length) { const su = rng.pick(suits); remember(me);
+  // ability at the Alsó's own level; claims stay the Alsó's (D-532, D-534, D-366). The play ability runs now; the copy stays on
+  // the entry (me.learned) so the Felső abilities that act at the trick's end or on the claim act for it too (D-1205)
+  if (RURAL.apprentice(c) && c.learnedSuit && !m.retrigger && !frozen(st, me)) {
+    { const su = c.learnedSuit; delete c.learnedSuit; delete c.entered; remember(me);
       Object.assign(c, { suit: su, rank: "Felső", roster: "main", refined: r }); delete c.name; const e = upgradeEntry(c); if (c.adjective) c.adjective = e?.adjective;
       matchSay(m, `Learning the Trade: the apprentice works like a ${su} Felső.`);
       m.retrigger = true; try { run(m, seat, c, me); } finally { m.retrigger = false; }
-      restoreIdentities([me]); }
+      restoreIdentities([me]); me.learned = { suit: su, rank: "Felső", roster: "main", refined: r }; }
   }
   // Claim Suppression (Court Merchant): cards beneath worth less (card value, D-539) lose and can't establish claims, until the
   // trick ends or another claimant is played on top; the Mercer takes the claim if none is left; 1 coin per claim cut (D-538, D-539)
@@ -677,7 +774,7 @@ function ruralOnPlay(m, seat, c, me, rng, run) {
     const prevSeat = st.length >= 2 ? st[st.indexOf(me) - 1]?.seat : null;
     const who = r >= 2 ? [1, 2, 3].map((k) => (seat + k) % 4) : (prevSeat != null && prevSeat !== seat ? [prevSeat] : []);
     for (const s2 of who) {
-      const mine = [...st].reverse().find((x) => x.seat === s2 && x !== me && !x.tower && !x.inserted); if (!mine) continue;
+      const mine = [...st].reverse().find((x) => x.seat === s2 && x !== me && !x.tower && !x.inserted); if (!mine || frozen(st, mine) || bound(st, mine) || ALT.tools(mine.card)) continue;   // can't be swapped (D-625; D-1204)
       const up = m.hands[s2].filter((x) => RANK_ORDER.indexOf(x.rank) > RANK_ORDER.indexOf(mine.card.rank)); if (!up.length) continue;
       const pick = choose(m, rng, up, (x) => st.map((y) => (y === mine ? { ...y, card: x } : y)));
       m.hands[s2].splice(m.hands[s2].indexOf(pick), 1, mine.card); mine.card = pick; mine.placed = true;
@@ -749,14 +846,18 @@ function townsfolkOnPlay(m, seat, c, me, rng, run) {
   // Tall Tales (Bard): the next card on top of the Bard looks like a random card to everyone else; once per encounter
   if (TOWNS.bard(c) && once(m, "tales", c)) me.tallTales = true;
   // Market Day! (Mayor): two random rank VIII commodities (three with Pompous) on top of the trick, random suit and stage;
-  // their on-play abilities trigger; capturable spoils
+  // their on-play abilities trigger; capturable spoils for whoever wins the trick; owned by no one, so ignored for claims (D-1206)
   if (TOWNS.mayor(c)) {
     const n = c.adjective === "Pompous" ? 3 : 2;
     for (let k = 0; k < n; k++) {
       const suit = rng.pick(VIII_SUITS), stage = Math.floor(rng.next() * 3);
       const v = COMMODITY_STAGES.filter((x) => x.suit === suit && x.rank === "VIII" && x.stage === stage && x.roster === "main");
       const g = card("VIII", suit, { origin: "enc", generated: true, ...(stage ? { refined: stage } : {}), ...(v.length ? { name: v[0].name } : {}) });
-      st.push({ seat, card: g }); run(m, seat, g);
+      // owned by no one (urban.md): never takes or blocks a claim, and what its on-play ability earns goes to nobody (D-1206)
+      st.push({ seat, card: g, noClaim: true, ownerless: true });
+      const g0 = m.generated.length, c0 = m.coins, s0 = m.sideGains ? { n: m.sideGains.generated.length, c: m.sideGains.coins } : null;
+      run(m, seat, g);
+      m.generated.length = g0; m.coins = c0; if (s0) { m.sideGains.generated.length = s0.n; m.sideGains.coins = s0.c; }
     }
     matchSay(m, `Market Day! ${n} goods pile onto the trick.`);
   }
@@ -765,7 +866,8 @@ function townsfolkOnPlay(m, seat, c, me, rng, run) {
   if (TOWNS.builder(c) && m.deck.length >= 4 && once(m, "tower", c)) {
     const tower = []; for (let k = 0; k < 4; k++) tower.push(m.deck.splice(Math.floor(rng.next() * m.deck.length), 1)[0]);
     for (const x of tower) st.push({ seat, card: x, tower: true });
-    if (c.refined >= 2) { const el = tower.filter((x) => (x.rank === "VIII" || x.rank === "X") && (x.refined || 0) < 2); if (el.length) { const x = rng.pick(el); x.refined = (x.refined || 0) + 1; } }
+    // a Millstone Pair freezes the stack (D-625; D-1204)
+    if (c.refined >= 2 && !st.some((x) => frozen(st, x))) { const el = tower.filter((x) => (x.rank === "VIII" || x.rank === "X") && (x.refined || 0) < 2); if (el.length) { const x = rng.pick(el); x.refined = (x.refined || 0) + 1; } }
     matchSay(m, `Erection: a tower of four cards rises on the trick${c.refined >= 2 ? " (one good refined)" : ""}.`);
   }
 }
@@ -773,6 +875,15 @@ function townsfolkOnPlay(m, seat, c, me, rng, run) {
 const isFarm = (card, rank) => (!card.roster || card.roster === "main") && card.suit === "Farmfolk" && card.rank === rank;
 const isClergy = (card, rank) => (!card.roster || card.roster === "main") && card.suit === "Clergy" && card.rank === rank;
 const FACE3 = new Set(["Alsó", "Felső", "Király"]);
+// the alternative Clergy face cards (D-565 to D-569; D-1192)
+const altClergy = (c, rank) => c.suit === "Clergy" && c.rank === rank && c.roster === "alternative";
+export const ALT_CLERGY = {
+  wayfarer: (c) => altClergy(c, "Ász") && (c.refined || 0) >= 1,          // Pay It Forward
+  samaritan: (c) => altClergy(c, "Ász") && (c.refined || 0) >= 2,         // and the hand clog
+  selfless: (c) => altClergy(c, "Ász") && c.adjective === "Selfless",     // Alms (personal deck)
+  scribe: (c) => altClergy(c, "Alsó") && (c.refined || 0) >= 1,           // Transcription
+  meticulous: (c) => altClergy(c, "Alsó") && c.adjective === "Meticulous", // Scriptoria (personal deck)
+};
 export const CLERGY = {
   fanatic: (c) => isClergy(c, "VII") && (c.refined || 0) >= 1,            // Fanatic
   undying: (c) => isClergy(c, "VII") && c.adjective === "Undying",        // Resurrection
@@ -864,7 +975,7 @@ function forestOnPlay(m, seat, c, me, rng) {
   // matching rank's, that claim is cancelled; authority falls back; the Archbishop's protection holds (D-243, D-270, D-651)
   if (FOREST.cured(c) && below && once(m, "falseclaim", c)) {
     const cl = claimOf(st.slice(0, i)), ok = cl && st[cl.index] === below && cl.reason !== "Ecclesiastical Authority"
-      && (!["matching rank", "led card", "Seven", "Herd Guard"].includes(cl.reason) || (r >= 2 && below.card.rank === "VII" && cl.reason !== "matching rank"));
+      && (!["matching rank", "led card", "Seven", "Herd Guard"].includes(cl.reason) || (r >= 2 && (below.card.rank === "VII" || below.claimRank === "VII") && cl.reason !== "matching rank"));   // the current capture status, not the printed rank (D-270, D-651; D-1204)
     if (ok) { below.falseClaim = true; matchSay(m, `False Claim: the ${below.card.name || below.card.rank + " of " + below.card.suit}'s claim is exposed as false.`); }
   }
   // Lost in the Woods (Woodswise IX): the card to match and the claimant are hidden from everyone until the claim next changes (D-247, D-277)
@@ -878,7 +989,7 @@ function forestOnPlay(m, seat, c, me, rng) {
     } else matchSay(m, "Alluring Scent: nothing takes the bait (50%).");
   }
   // Set Trap (Trapper): at the end of the trick, before the award, the top two cards swap; several Trappers in play order (D-650)
-  if (FOREST.trapper(c)) (t.endHooks ??= []).push((mm) => {
+  if (FOREST.trapper(c) && !(me.saved && me.saved.rank === "VII")) (t.endHooks ??= []).push((mm) => {   // a disguised Ranger isn't a Trapper (D-1204)
     const s2 = mm.trick.stack, n = s2.length;
     if (n >= 2 && !(n === 2 && s2[0].insulated) && !frozen(s2, s2[n - 1]) && !frozen(s2, s2[n - 2]) && !bound(s2, s2[n - 1], true) && !bound(s2, s2[n - 2], true)) {
       [s2[n - 1], s2[n - 2]] = [s2[n - 2], s2[n - 1]]; matchSay(mm, "Set Trap: the top two cards are swapped.");
@@ -901,8 +1012,11 @@ function forestOnPlay(m, seat, c, me, rng) {
     const alpha = () => card("Alsó", "Beasts", { refined: 1, name: "Alpha", origin: "enc", generated: true });
     m.hands[seat].push(Object.assign(alpha(), { summoned: true }));
     if (r >= 2) {
-      const n = st.length, where = rng.pick(["top", "inner", "low"]), pos = where === "top" ? n : where === "low" ? 1 : 1 + Math.floor(rng.next() * Math.max(1, n - 1));
-      if (canInsert(st, pos)) st.splice(pos, 0, { seat, card: alpha(), placed: true });
+      // the insertion place is a random selection, so Weighted Odds can lean it (D-602; D-1204)
+      const n = st.length, wolf = { seat, card: alpha(), placed: true }, opts = [n, 1, ...Array.from({ length: Math.max(0, n - 2) }, (_, k) => 2 + k)].filter((p2, k, a) => a.indexOf(p2) === k);
+      const where = rng.pick(["top", "inner", "low"]), base = where === "top" ? n : where === "low" ? 1 : 1 + Math.floor(rng.next() * Math.max(1, n - 1));
+      const pos = m.trick.weighted ? choose(m, rng, opts, (p2) => { const t2 = st.slice(); t2.splice(p2, 0, wolf); return t2; }) : base;
+      if (canInsert(st, pos)) st.splice(pos, 0, wolf);
     }
     matchSay(m, r >= 2 ? "Wolf Summoning: the horn calls the pack: an Alpha to your hand, another into the trick." : "Wolf Summoning: an Alpha answers the horn.");
   }
@@ -944,7 +1058,8 @@ function hillOnPlay(m, seat, c, me, rng, run) {
   // without one, or if it has no ability (explicit retrigger, D-313)
   if (HILL.chamberlain(c) && once(m, "jurisdiction", c)) {
     const x = st.slice(0, i).reverse().find((y) => y.card.suit === "Hillfolk" && !y.placed && !y.inserted);
-    if (x && hasAbility(x.card)) {
+    // any upgraded Hillfolk card qualifies, an overworld-only one included (your answer, D-1219); a stopped one is a blank card (D-641 (4))
+    if (x && hasAbility(x.card) && !x.silenced && !x.based && !x.suppressed) {
       m.chainRun = true; try { run(m, x.seat, x.card, x); } finally { m.chainRun = false; }
       if (side === 0) m.coins += 2; matchSay(m, `Jurisdiction: the ${x.card.name || x.card.rank + " of Hillfolk"} acts again${side === 0 ? "; 2 coins" : ""}.`);
     } else matchSay(m, "Jurisdiction: no Hillfolk card to rule on.");
@@ -1053,7 +1168,7 @@ function fishOnPlay(m, seat, c, me, rng, run) {
   // Borrowed Tricks (Bogman: an ability a card in the trick has; Pákász: one it could have): a copy fires as this card's own, its
   // claims this card's player's (D-366, D-652)
   if (FISH.bogman(c) && once(m, "borrow", c)) {
-    const up = (x) => (x.card.refined || 0) > 0 || !!x.card.adjective;
+    const up = (x) => ((x.card.refined || 0) > 0 || !!x.card.adjective) && !x.silenced && !x.based && !x.suppressed;   // a stopped card is blank (D-641 (4); D-1220)
     const el = st.filter((x) => x !== me && !(isFish(x.card, "Ász") && x === me) && x.card !== c && (r >= 2 ? !!upgradeEntry(x.card) : up(x)));
     if (el.length) {
       const x = choose(m, rng, el, () => null), e = upgradeEntry(x.card);
@@ -1095,7 +1210,7 @@ function agriOnPlay(m, seat, c, me, rng) {
     const i = st.indexOf(me), eaten = [st[i - 1], st[i - 2]].filter((x) => x && !frozen(st, x) && !bound(st, x) && !ALT.tools(x.card) && !(x === st[0] && insulated(x)));
     if (eaten.length) {
       for (const x of eaten) st.splice(st.indexOf(x), 1);
-      m.captured[side].push(...eaten.filter((x) => x.card.origin === "enc").map((x) => x.card));
+      spoil(m, seat, eaten.filter((x) => x.card.origin === "enc").map((x) => x.card));
       for (const x of eaten) if (x.card.origin === "pers") (m.returned ??= []).push(x.card);
       m.history.push({ stack: eaten, winner: seat, team: side, devoured: true });
       matchSay(m, `Devour! The Plague strips ${eaten.length} card${eaten.length === 1 ? "" : "s"} from the trick for ${m.names[seat]}.`);
@@ -1226,7 +1341,7 @@ function beforeAbilities(m, me, rng) {
   if (!liveE(prev)) return;
   if (RURAL_T.miller(prev.card)) {
     const i = st.indexOf(prev);
-    if (!(me.card.refined >= 1) || frozen(st, me) || !canInsert(st, i)) { matchSay(m, "Grinding: nothing to grind here."); return; }
+    if (!(me.card.refined >= 1) || frozen(st, me) || ALT.tools(me.card) || !canInsert(st, i)) { matchSay(m, "Grinding: nothing to grind here."); return; }   // Tools untargetable (D-641)
     restage(me, -1);
     st.splice(i, 0, { seat: prev.seat, card: card("VIII", "Farmfolk", { origin: "enc", generated: true, name: "Wheat" }), inserted: true });
     matchSay(m, `Grinding: the ${me.card.name || me.card.rank} is ground down a stage, and Wheat spills beneath the Miller.`);
@@ -1259,7 +1374,7 @@ function townsRuralOnPlay(m, seat, c, me, rng) {
     matchSay(m, `Raise the Alarm: a Volunteer comes running to ${m.names[seat]}.`);
   }
   // Sticky Dough (Bread Dough, Bread; D-618, D-654): played directly on the capture target, it swaps in as the new one (Bull Toss swap)
-  if (RURAL_T.dough(c) && st.indexOf(me) === 1 && !frozen(st, st[0]) && !frozen(st, me) && once(m, "dough", c)) {
+  if (RURAL_T.dough(c) && st.indexOf(me) === 1 && !frozen(st, st[0]) && !frozen(st, me) && !bound(st, st[0], true) && !(PLAINS.stubborn(st[0].card) && !st[0].horizontal) && once(m, "dough", c)) {
     if (!insulated(st[0])) { [st[0], st[1]] = [st[1], st[0]]; matchSay(m, "Sticky Dough: the dough smothers the card to match and takes its place."); }
   }
   // Market Run (Unremarkable IX): on a rank VIII, a basic copy of its effective identity for your cargo (D-622, D-736)
@@ -1269,7 +1384,7 @@ function townsRuralOnPlay(m, seat, c, me, rng) {
   }
   // Remedy (Herbalist): undoes the temporary change on one random allied card in the trick (D-608)
   if (RURAL_T.herbalist(c)) {
-    const el = st.filter((x) => x !== me && team2(x.seat) === side && (x.saved || x.revertSuit) && !frozen(st, x));
+    const el = st.filter((x) => x !== me && team2(x.seat) === side && (x.saved || x.revertSuit) && !frozen(st, x) && !ALT.tools(x.card));   // no ability acts on Assassination Tools (D-641)
     if (el.length && once(m, "remedy", c)) {
       const x = choose(m, rng, el, () => null);
       if (x.saved) restoreIdentities([x]); if (x.revertSuit) { x.card.suit = x.revertSuit; delete x.revertSuit; }
@@ -1298,10 +1413,17 @@ function townsRuralOnPlay(m, seat, c, me, rng) {
   if (RURAL_T.starEyed(c) && claimOf(st).team === side && once(m, "mesmer", c)) t.mesmer = { team: side, card: c };
 }
 function silence(m, x) {
-  x.silenced = true; x.insulated = false; delete x.prot; delete x.roots; delete x.racket; delete x.keep; x.lawNext = x.noFunny = x.saddle = x.tallTales = x.sleepy = false; delete x.tenacious;
+  // an identity an ability gave (a Magnate's Seven, Lekking, Home Advantage, Outfitting) reverts, but a claim it already holds
+  // stands: kept against the cards already in the trick, later cards overturn it as usual (D-627 (4), D-641 (4); D-1207)
+  const st0 = m.trick?.stack, held = x.claimRank && !x.bike && st0 && st0.includes(x) && (() => { const cl = claimOf(st0); return cl && st0[cl.index] === x; })();
+  if (x.claimRank && !x.bike) delete x.claimRank;
+  x.silenced = true; x.insulated = false; delete x.prot; delete x.roots; delete x.racket; delete x.keep; x.lawNext = x.noFunny = x.saddle = x.tallTales = x.sleepy = x.ward = false; delete x.tenacious;   // Ward Off is a pending restriction too (D-641; D-1211)
   if (m.lek && m.lek.card === x.card) m.lek = null;
-  for (const k of ["ferment", "revulsion", "indulge", "toArms", "chain", "anotherRound", "councillor", "mesmer"]) if (m.trick[k] && (m.trick[k].card === x.card || m.trick[k].by === x.seat && k === "ferment")) m.trick[k] = null;
+  // Silence ends every ongoing effect the card set (D-641; D-1204): Covering Fire, Outfitting, Final Nail / Let It Ride / Cash Out,
+  // Tempting, Weighted Odds, Pay It Forward included
+  for (const k of ["ferment", "revulsion", "indulge", "toArms", "chain", "anotherRound", "councillor", "mesmer", "cover", "outfit", "roundRule", "tempt", "weighted", "forward"]) if (m.trick[k] && (m.trick[k].card === x.card || m.trick[k].by === x.seat && k === "ferment")) m.trick[k] = null;
   for (const k of ["hearYe", "rightOfWay", "intimidate"]) if (m[k] && m[k].card === x.card) m[k] = null;
+  if (held) x.keep = new Set(st0);
 }
 // alternative commodity lines (commodity-alternatives.md), recognised by suit, rank and line
 const isAlt = (c, suit, rank, line) => c.roster === "alternative" && c.suit === suit && c.rank === rank && lineBase(c) === line;
@@ -1451,6 +1573,8 @@ export const FARMFOLK = {
 /** Ability hook for the end of each trick. */
 // a gain for seat k's owner: yours, unless seat 2 isn't your companion (a shared match's partner, D-914, or the Impresario, who keeps
 // half, D-340): then it's set aside for that seat's owner
+// spoils taken by an ability go to the team's pile and, at a shared table, to the seat that took them (D-914; D-1185's fix)
+function spoil(m, seat, cards, team = seat % 2) { m.captured[team].push(...cards); if (m.capturedBySeat && seat != null) m.capturedBySeat[seat].push(...cards); }
 function credit(m, k, coins = 0, gen = null) {
   if ((m.shared || m.mercHalf) && k === 2) { m.sideGains ??= { generated: [], coins: 0 }; m.sideGains.coins += coins; if (gen) m.sideGains.generated.push(gen); return; }
   m.coins += coins; if (gen) m.generated.push(gen);
@@ -1458,19 +1582,36 @@ function credit(m, k, coins = 0, gen = null) {
 export function onTrick(rng = { next: Math.random }, ownerPersonal = [], ownerCargo = []) {
   return (m, stack, claim) => {
     const live = stack.filter((x) => !x.horizontal && !x.based && !x.tower && !x.inserted && !x.noAbility && !x.placed);   // placed / inserted cards weren't played
+    // Conversion (Evangelist): one non-Clergy Alsó, Felső or Király in the trick becomes Clergy for good, before the spoils and
+    // before the winner is finalised: a conversion that completes the Bishop's three Clergy cards counts (D-193 (1); D-1202);
+    // Proselytising (a refined Clergy X in the converting side's personal deck) adds one (Illuminated) or two (Sacred Tome)
+    for (const ev of live.filter((x) => CLERGY.evangelist(x.learned || x.card))) {   // x.learned: an apprentice's copied Felső (D-532)
+      const extra = ev.seat % 2 === 0 ? Math.max(0, ...ownerPersonal.filter(CLERGY.proselytising).map((x) => x.refined)) : 0;
+      for (let k = 0; k < 1 + extra; k++) {
+        const el = stack.filter((x) => FACE3.has(x.card.rank) && x.card.suit !== "Clergy" && !(x === stack[0] && x.insulated) && !frozen(stack, x));
+        if (!el.length) break;
+        const t = el[Math.floor(rng.next() * el.length)];
+        // on a temporary identity (Disguise, Hunting Orders) only that identity is painted; the real card is unchanged (D-193 (2), D-209)
+        setSuit(t.card, "Clergy"); if (t.card.ref && !t.saved) setSuit(t.card.ref, "Clergy"); if (!t.saved) delete t.revertSuit;
+        matchSay(m, `Conversion: the ${t.card.rank} becomes Clergy.`); if (m.trick) m.trick.converted = true;
+      }
+    }
+    if (m.trick?.converted) { const c2 = claimOf(stack); if (c2) claim = c2; m.trick.converted = false; }   // re-evaluated after a Conversion
     // Sticky Fleece (Silken-, Golden-Fleeced Lamb; D-651): the trick's other captured cards stick together in a bundle; the lamb
     // stays separate; it beats Resurrection (D-193); bundles matter for the player's cargo
     const lamb = live.find((x) => (!x.card.roster || x.card.roster === "main") && x.card.suit === "Farmfolk" && x.card.rank === "Ász" && (x.card.refined || 0) >= 1);
+    // Sticky Fleece beats Resurrection only for the cards in its bundle (D-193 (4); D-1204)
     if (lamb) {
-      for (const x of stack) x.resurrect = false;
       const others = stack.filter((x) => x !== lamb && x.card.origin === "enc");
       if (claim.team === 0 && others.length > 1) { const b = { id: "b" + Math.floor(rng.next() * 1e9), golden: lamb.card.refined >= 2 };
-        for (const x of others) x.card.bundle = b; matchSay(m, `Sticky Fleece: ${others.length} captured cards stick together in a bundle.`); }
+        for (const x of others) { x.card.bundle = b; x.resurrect = false; } matchSay(m, `Sticky Fleece: ${others.length} captured cards stick together in a bundle.`); }
     }             // a sideways play uses no Trick Ability (D-101); Law of the Land
     // Hunting Season (Forester): four different encounter suits in the trick pay its player 4 coins, each Forester (D-318)
-    for (const x of live.filter((y) => FOREST.forester(y.card))) if (new Set(stack.map((y) => y.card.suit).filter((su) => !m.suits || m.suits.includes(su))).size >= 4 && x.seat % 2 === 0) { credit(m, x.seat, 4); matchSay(m, "Hunting Season: four kinds of quarry in one trick: 4 coins."); }
+    for (const x of live.filter((y) => FOREST.forester(y.learned || y.card))) if (new Set(stack.map((y) => y.card.suit).filter((su) => !m.suits || m.suits.includes(su))).size >= 4 && x.seat % 2 === 0) { credit(m, x.seat, 4); matchSay(m, "Hunting Season: four kinds of quarry in one trick: 4 coins."); }
     // Virtus: the Calves go straight into the spoils of whoever takes the trick
-    for (const x of live) for (let k = 0; k < (x.virtus || 0); k++) m.captured[claim.team].push(card("X", "Plainsfolk", { origin: "enc", generated: true, name: "Calf" }));
+    // (nobody captures on a neutral Tusker win: no Calves then; they count toward Criminal Commission as spoils, D-1204)
+    if (!(claim.seat < 0)) for (const x of live) for (let k = 0; k < (x.virtus || 0); k++) { const calf = card("X", "Plainsfolk", { origin: "enc", generated: true, name: "Calf" });
+      spoil(m, claim.seat, [calf], claim.team); (m.trick.extraSpoils ??= []).push(calf); }
     // Great Escape (Plainsfolk Ász): Fugitive returns to its player's hand if the other side takes the trick; Betyár whoever
     // takes it; once per encounter; the winners still capture the rest
     for (const x of live.filter((y) => PLAINS.fugitive(y.card))) {
@@ -1480,19 +1621,7 @@ export function onTrick(rng = { next: Math.random }, ownerPersonal = [], ownerCa
     }
     // Resurrection (Undying Clergy VII): back to its origin deck instead of being captured
     // (Sticky Fleece beats Resurrection, D-193)
-    for (const x of live) if (CLERGY.undying(x.card) && !lamb) { x.resurrect = true; matchSay(m, "Resurrection: the Devotee returns to its deck."); }
-    // Conversion (Evangelist): one non-Clergy Alsó, Felső or Király in the trick becomes Clergy for good, before the spoils;
-    // Proselytising (a refined Clergy X in the converting side's personal deck) adds one (Illuminated) or two (Sacred Tome)
-    for (const ev of live.filter((x) => CLERGY.evangelist(x.card))) {
-      const extra = ev.seat % 2 === 0 ? Math.max(0, ...ownerPersonal.filter(CLERGY.proselytising).map((x) => x.refined)) : 0;
-      for (let k = 0; k < 1 + extra; k++) {
-        const el = stack.filter((x) => FACE3.has(x.card.rank) && x.card.suit !== "Clergy" && !(x === stack[0] && x.insulated) && !frozen(stack, x));
-        if (!el.length) break;
-        const t = el[Math.floor(rng.next() * el.length)];
-        setSuit(t.card, "Clergy"); if (t.card.ref) setSuit(t.card.ref, "Clergy"); delete t.revertSuit;
-        matchSay(m, `Conversion: the ${t.card.rank} becomes Clergy.`);
-      }
-    }
+    for (const x of live) if (CLERGY.undying(x.card) && !x.card.bundle) { x.resurrect = true; matchSay(m, "Resurrection: the Devotee returns to its deck."); }
     // Pilgrim's Offering (Disciple): +1 coin each when a Clergy Felső or Király is in the trick too
     const offer = live.filter((x) => CLERGY.disciple(x.card)).length;
     if (offer && stack.some((x) => x.card.suit === "Clergy" && (x.card.rank === "Felső" || x.card.rank === "Király"))) {
@@ -1519,14 +1648,16 @@ export function onTrick(rng = { next: Math.random }, ownerPersonal = [], ownerCa
     }
     // Craftsmanship (Master): one non-Tradesfolk VIII in the trick becomes a Tradesfolk VIII, keeping its upgrades; with none, an
     // ordinary Tradesfolk VIII is made directly beneath the Master
-    for (const x of live.filter((y) => TRADES.master(y.card))) {
-      const v = stack.find((y) => y.card.rank === "VIII" && y.card.suit !== "Tradesfolk" && !frozen(stack, y) && !(y === stack[0] && insulated(y)));
+    for (const x of live.filter((y) => TRADES.master(y.learned || y.card))) {
+      const vs = stack.filter((y) => y.card.rank === "VIII" && y.card.suit !== "Tradesfolk" && !frozen(stack, y) && !(y === stack[0] && insulated(y)));
+      const v = vs.length ? vs[Math.floor(rng.next() * vs.length)] : null;   // the one converted is chosen at random (ABL-20; D-1204)
       if (v) { if (v.card.origin === "pers") { v.revertSuit = v.revertSuit || v.card.suit; v.revertName = v.revertName ?? v.card.name; } setSuit(v.card, "Tradesfolk"); if (v.card.ref && v.card.origin === "enc") setSuit(v.card.ref, "Tradesfolk"); matchSay(m, "Craftsmanship: a VIII in the trick becomes Tradesfolk work."); }
       else if (canInsert(stack, stack.indexOf(x))) { stack.splice(stack.indexOf(x), 0, { seat: x.seat, card: card("VIII", "Tradesfolk", { origin: "enc", generated: true, name: "Cloth" }) }); matchSay(m, "Craftsmanship: the Master makes a bolt of Cloth."); }
     }
     // Criminal Commission (Master Fence): 5 % of the winners' spoils value to its player, rounded up (D-278); after Pillage
-    for (const x of live.filter((y) => BANDITS.masterFence(y.card))) if (x.seat % 2 === 0) {
-      const v = stack.filter((y) => y.card.origin === "enc" && !y.resurrect && !y.escape).reduce((a, y) => a + (m.value ? m.value(y.card) : 0), 0);
+    // nothing on a neutral Tusker win (D-211); cards Pillage took from this trick count (D-193 (5))
+    for (const x of live.filter((y) => BANDITS.masterFence(y.learned || y.card))) if (x.seat % 2 === 0 && !(claim.seat < 0)) {
+      const v = [...stack.filter((y) => y.card.origin === "enc" && !y.resurrect && !y.escape).map((y) => y.card), ...(m.trick?.pillaged || []), ...(m.trick?.extraSpoils || [])].reduce((a, c3) => a + (m.value ? m.value(c3) : 0), 0);
       const n = Math.ceil(v * 0.05); if (n) { credit(m, x.seat, n); matchSay(m, `Criminal Commission: ${n} coin${n === 1 ? "" : "s"} for the Master Fence.`); }
     }
     // Victory Refinement (Hard-Won King's Men VIII played from a hand): refines one stage when its side takes the trick;
@@ -1543,9 +1674,9 @@ export function onTrick(rng = { next: Math.random }, ownerPersonal = [], ownerCa
     // Stalking: the prey, if still in the trick, advances one refinement stage before the spoils (never an adjective)
     // Stalking: one randomly chosen eligible upgrade the prey can still take: its next refinement stage or its adjective, never
     // Attrition or one it already has (D-295, D-300)
-    for (const x of live.filter((y) => BEASTS.phantom(y.card) && y.prey)) {
+    for (const x of live.filter((y) => BEASTS.phantom(y.learned || y.card) && y.prey && !(claim.seat < 0))) {   // no team captures: no upgrade (wild.md)
       const p = x.prey, target = p.saved ? null : p.card;
-      if (!stack.includes(p) || !target || frozen(stack, p)) continue;
+      if (!stack.includes(p) || !target || frozen(stack, p) || p.escape) continue;   // an escaped prey: Stalking fails (D-193 (3))
       const e = upgradeEntry(target), pool = [];
       if ((target.refined || 0) < maxStage(target)) pool.push("refine");
       if (e && e.adjective && !target.adjective) pool.push("adjective");
@@ -1555,11 +1686,12 @@ export function onTrick(rng = { next: Math.random }, ownerPersonal = [], ownerCa
       else { target.refined = (target.refined || 0) + 1; const nm = COMMODITY_STAGES.find((s2) => s2.suit === target.suit && s2.rank === target.rank && s2.roster === (target.roster || "main") && s2.stage === target.refined); if (nm) target.name = nm.name; }
       if (e) target.name = (target.adjective ? target.adjective + " " : "") + e.stages[target.refined || 0];
       if (target.ref) { target.ref.refined = target.refined; target.ref.adjective = target.adjective; target.ref.name = target.name; }
+      if (pick !== "adjective") (m.refinedInMatch ??= []).push(target.ref || target);   // "whenever refined" effects run after the match (D-1204)
       matchSay(m, `Stalking: the hunted ${target.rank} of ${target.suit} comes out stronger (${pick === "adjective" ? "a new ability" : "refined"}).`);
     }
     restoreIdentities(stack);                                                // Identity Theft, Hallucination, Contamination of personal cards
     // a Fanatic's (or any temporary) change to a personal card lasts only for the trick
-    for (const x of stack) if (x.revertSuit) { x.card.suit = x.revertSuit; if (x.revertName !== undefined) { if (x.revertName) x.card.name = x.revertName; else delete x.card.name; } delete x.revertSuit; delete x.revertName; }
+    for (const x of stack) if (x.revertSuit) { x.card.suit = x.revertSuit; if (x.revertRoster !== undefined) { if (x.revertRoster) x.card.roster = x.revertRoster; else delete x.card.roster; delete x.revertRoster; } if (x.revertName !== undefined) { if (x.revertName) x.card.name = x.revertName; else delete x.card.name; } delete x.revertSuit; delete x.revertName; }
     // Harvest Wages: each Seasonal Farmhand in the trick adds +1 coin to the spoils if a Farmfolk VIII or X is present;
     // the side that takes the trick gets it (makk.md)
     const wages = live.filter((x) => FARMFOLK.seasonal(x.card)).length;
@@ -1574,12 +1706,17 @@ export function onTrick(rng = { next: Math.random }, ownerPersonal = [], ownerCa
       if (a) { a.card.refined = 1; if (a.card.ref) a.card.ref.refined = 1; matchSay(m, `Conscription: the Farmhand becomes a Conscript.`); }
     }
     // Collection Plate (D-246): count every Clergy card in the trick; the trick's winning side gets +1 coin per Clergy
-    // card, whichever side played the Clergy IX. Only the player's coins are tracked (NPC wealth isn't modelled).
-    for (const { card } of stack) if (CLERGY_IX.collectionPlate(card)) {
+    // card, whichever side played the Clergy IX. Coins go to the player, and to an AI caravan's purse when an AI caravan's seat
+    // wins it at a shared table (D-246; D-1174); a local's coins aren't modelled.
+    for (const { card } of live) if (CLERGY_IX.collectionPlate(card)) {   // played, not sideways or based (D-101; D-1204)
       const n = stack.filter((x) => x.card.suit === "Clergy").length;
+      if (claim.seat < 0) { matchSay(m, "Collection Plate: the Tusker takes the trick; nobody collects."); continue; }   // a neutral win (D-211)
       if (claim.team === 0) { credit(m, claim.seat, n); matchSay(m, `Collection Plate: ${n} Clergy card${n === 1 ? "" : "s"} in the trick, +${n} coin${n === 1 ? "" : "s"} for your side.`); }
+      else if (m.shared && m.shared[claim.seat]?.kind === "caravan") { m.seatCoins ??= {}; m.seatCoins[claim.seat] = (m.seatCoins[claim.seat] || 0) + n;
+        matchSay(m, `Collection Plate: ${m.names[claim.seat]} wins this trick and its ${n} coin${n === 1 ? "" : "s"}.`); }
       else matchSay(m, `Collection Plate: the rivals win this trick and its ${n} coin${n === 1 ? "" : "s"}.`);
     }
+    return claim;                                                            // the winner as finalised (Conversion, D-193)
   };
 }
 

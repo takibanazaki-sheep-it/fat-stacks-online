@@ -26,12 +26,18 @@ export function offerPool(rng, suits, value) {
   ];
 }
 
+// the greedy ally's terms (D-179): it takes its own rewards and yours; you forfeit everything your team captures in this match.
+// Only a greedy ally offers it, and only you can accept it; no splitting or alternating picks
+export const GREEDY = { cat: 7, id: "greedy", text: "Greedy ally: your partner keeps your share as well as its own: everything your team captures goes to them, and you take nothing captured from this match." };
+
 /** three locals of at least three suit types where the location allows (D-151), each with four offers and a pick */
 export function participants(rng, suits, pool) {
   const kinds = pickN(rng, suits, 3);
   while (kinds.length < 3) kinds.push(rng.pick(suits));
   return kinds.map((suit, k) => {
     const shown = pickN(rng, pool, 4);
+    // a greedy ally (D-179; D-1183): it asks for your share of the captures as its pick; chance PLACEHOLDER
+    if (rng.next() < PLACEHOLDER.negotiation.greedy) return { id: k, suit, name: `${suit} local`, shown, pick: GREEDY, greedy: true };
     return { id: k, suit, name: `${suit} local`, shown, pick: rng.pick(shown) };   // NPC choice: random among its four (an AI placeholder)
   });
 }

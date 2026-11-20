@@ -83,14 +83,27 @@ export const PLACEHOLDER = {
   packLeader: 0.5,                         // Pack Leader's military per Beasts card in cargo ("Amount TBD")
   gamekeeper: 2,                           // Gamekeeper's coins per off-highway road ("Amount TBD")                         // Beast Defence's military against Beasts (townsfolk-rural.md: deferred to balancing, D-628)                    // Marching Formation's road-encounter military bonus (royal.md: TBD)
   ransom: 3,                               // Ransom coins per Aspiring Squire for a won road fight (royal.md: TBD)
-  oracleSuspicion: 2,                      // the Oracle's "high inherent suspicion" (D-653: value TBD)
+  oracleSuspicion: 2,
+  goldenFleeceSuspicion: 2,                // the Golden-Fleeced Lamb's own suspicion (makk.md "highly suspicious"; value TBD; D-1204)                      // the Oracle's "high inherent suspicion" (D-653: value TBD)
   stickyBundleSuspicion: 3,                // Sticky Fleece: "substantial additional suspicion" per Silken bundle (SUS-05: a value)
   qualityTier: 2,                          // Quality Improvement: value added per tier (V8-01: the tier values aren't built)
   cheapLabour: 0.2,                         // Cheap Labour: Guild refinement discount (tok.md gives no amount)
   exactCopyChance: 0.5,                    // PLACEHOLDER: D-662 quality roll, chance TBD
   routineInspectionChance: 0.5,            // PLACEHOLDER: CHK-15 open
   guardBribe: 3,                           // PLACEHOLDER: CHK-15 open ("relatively small bribe", D-135)
-  secondInspectionSizes: [2, 3, 4, 5],     // PLACEHOLDER: CHK-17 open (fewer, same or more than the first)
+  secondInspectionSizes: [2, 3, 4, 5],
+  townMinorCheckpoint: 0.15,
+  briberyMilitary: [1, 2, 3],             // PLACEHOLDER: military (in Sevens) a Bribery allocation buys at a checkpoint, by stage (tok.md; D-1203)
+  wagonUpgrade: { slots: 8, prices: [30, 60], max: 2 },   // PLACEHOLDER: Magistrates wagon capacity (D-394, D-553 "8 unlocked", D-1200)
+  travellingSuit: 0.2,                   // PLACEHOLDER: an encounter point's people include a travelling suit (D-750, D-1199)
+  fairChance: 0.15,                      // PLACEHOLDER: a settlement match on fair day, Carnivalfolk in the deck (D-749, D-1199)
+  regionalScarcity: 0.25,                // PLACEHOLDER: sale premium for a commodity whose suit lives nowhere in the region (D-417, D-423, D-1195)
+  scriptoriaParchment: 1,                // PLACEHOLDER: Parchment per Hides (D-568: 1 or 2, open until commodity values exist)
+  parchmenterChance: 0.5,                 // PLACEHOLDER: a Clergy Alsó in a deck with Clergy and Forestfolk is the Parchmenter (D-568 placement intent, D-1192)
+  cpEncounter: { chance: 0.3, carnival: 0.5 },   // PLACEHOLDER: an encounter at the checkpoint on arrival, and the share that is the travelling Carnival (D-407 (2), D-1191)
+  corruption: { glitchPlace: 0.03, fenceChance: 0.12, glitchSale: 2, cardSale: 3, identify: 10, identifyStep: 1.5, lottery: [5, 15, 40], paratroopers: 1 },   // PLACEHOLDER (D-751, D-764, D-1186)
+  reportedSuspicion: 3,                  // PLACEHOLDER: suspicion for the rest of the region after a King's Men caravan reports you (D-412, D-1185)
+  greetingRumour: 0.3,                   // PLACEHOLDER: chance a settlement greeting carries a rumour about the King's tastes (D-435, D-1182)             // PLACEHOLDER: chance of a minor checkpoint at a town or city gate on arrival (D-456, D-1180)     // PLACEHOLDER: CHK-17 open (fewer, same or more than the first)
   trickLimit: 6,                           // PLACEHOLDER: D-172 POI/ordinary limit "about 5–6" (checkpoint ~8); exact value at balancing
   // POI rewards (D-725 directions; D-705 for resource sites): chance that a commodity slot in the POI's encounter deck holds a
   // valuable stage / an upgraded stage. PLACEHOLDERS. Settlements: none (ordinary locations). Bandit-overrun village
@@ -103,9 +116,14 @@ export const PLACEHOLDER = {
     "bandit-overrun village": { tagLean: { chance: 0.5, tags: ["valuable", "illicit"] } },   // D-725: monetary loot (coin goods, valuables)
     "military camp":   { tagLean: { chance: 0.5, tags: ["military"] } },  // D-725: royal military presence (King's Men)
     "monastery":       { upgraded: 0.25, valuable: 0.2, aszUpgraded: 0.3 }, // D-725: possible upgraded valuables, commodities or Ász
+    // hidden resource sites (D-705, D-725): a higher chance of valuable commodities and already-upgraded cards than their visible kind;
+    // PLACEHOLDERS (D-1187)
+    "hidden cave":           { valuable: 0.65, upgraded: 0.15 },
+    "hidden abandoned mine": { valuable: 0.45, upgraded: 0.3 },
+    "hidden active mine":    { valuable: 0.2, upgraded: 0.2 },
   },
   // POI negotiation terms (D-263: "no prices, percentages or exchange rates are set"): PLACEHOLDERS
-  negotiation: { cardPriceMult: 1.5, upFront: 4, profitShare: 0.25, seconds: 4.5 },   // 4-5 s window (D-263)
+  negotiation: { cardPriceMult: 1.5, upFront: 4, profitShare: 0.25, seconds: 4.5, greedy: 0.15 },   // 4-5 s window (D-263)
   // Mines lean to their minerals (D-643 "mines raise odds", D-759 ore or salt): chance a Hillfolk commodity slot holds one
   mineLean: {
     ore:  { VIII: { chance: 0.8, names: ["Ore", "Copper Ore"] }, X: { chance: 0.6, names: ["Silver Ore", "Gold Ore"] } },
@@ -126,6 +144,8 @@ export const PLACEHOLDER = {
     peddlerOutsideChance: 0.2,             // "occasionally unusual commodities from outside the region" (D-796)
     treasureWeights: { coins: 0.6, commodity: 0.3, upgraded: 0.1 },   // D-804: coins likeliest, upgraded rarest
     treasureCoinsPerStop: 2,               // D-804: value scales with the stop's fixed number
+    treasureStopsPerGood: 4,               // D-804: one more commodity every 4 stops (PLACEHOLDER; D-1225)
+    treasureStopsPerStage: 6,              // D-804: one refinement stage more every 6 stops, up to the line's last (PLACEHOLDER; D-1225)
     travellerReward: { coinsChance: 0.5, coins: 5 },                    // D-798: money or a random card
     brokenDownMoney: 5,                    // D-796: "contribute money" (amount at balancing)
     innMarkup: 1.1, innDiscount: 0.8, innStock: 2,                      // D-807, D-811: slight markup / below settlement prices

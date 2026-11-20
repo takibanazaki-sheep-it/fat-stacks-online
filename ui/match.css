@@ -113,3 +113,13 @@
 .zm-body > :last-child { color: var(--ink); }
 .zc .kbd { color: #8a7d60; }
 .zc.s-corrupt { border-top: 6px solid #c2185b; } .zc.s-corrupt .m { color: #c2185b; }
+
+/* changes shown as changes (ENC-UI-28, ENC-UI-57, D-189, D-237) */
+@keyframes fx-enter { from { opacity: 0; transform: translateY(-14px) scale(.92); } to { opacity: 1; transform: none; } }
+@keyframes fx-moved { 0%, 100% { outline: 2px solid transparent; } 30% { outline: 3px solid #f0c35a; outline-offset: 2px; } }
+@keyframes fx-claimed { 0% { transform: scale(1); } 35% { transform: scale(1.12); box-shadow: 0 0 0 4px rgba(240,195,90,.85); } 100% { transform: scale(1); } }
+.zc.fx-enter { animation: fx-enter .35s ease-out; }
+.zc.fx-moved { animation: fx-moved .9s ease-in-out; }
+.zc.fx-claimed { animation: fx-claimed .7s ease-out; }
+.zm-logwrap .logall { font-size: 11px; padding: 0 6px; margin-left: 6px; width: auto; }
+@media (prefers-reduced-motion: reduce) { .zc.fx-enter, .zc.fx-moved, .zc.fx-claimed { animation: none; } }

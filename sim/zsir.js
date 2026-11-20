@@ -45,6 +45,8 @@ export function newMatch(setup) {
     onPlay: setup.onPlay || null,  // ability hook: (m, seat, card) after a card is played
     onTrick: setup.onTrick || null,// ability hook: (m, stack, claim) when a trick resolves, before the spoils move
     wanted: setup.wanted || null,
+    onHand: setup.onPlay?.onHand || null,   // ability hook: (m, seat, card) when a card enters a hand (Learning the Trade, D-532)
+    learnSuit: setup.learnSuit || null,     // the attacker's or challenger's suit in ambushes and duels (D-534)
     command: null,                 // the player's current request to their partner (D-409), cleared when the trick ends  // public: the cards the player's checkpoint asks for (the companion's AI values them)
     coins: 0,                      // coins the player's side earned from abilities during the match
     log: [],
@@ -55,7 +57,7 @@ export function newMatch(setup) {
   // D-227: an ambush that starts with exactly 16 cards allows two completed tricks although the deal empties the deck:
   // no encounter replenishment, personal replenishment as usual
   if (setup.twoTricksOnSixteen && setup.encounterDeck.length === 16 && !m.deck.length) { m.finalTrick = false; m.trickLimit = Math.min(m.trickLimit, 2); }
-  startTrick(m);
+  startTrick(m); enterHands(m);
   return m;
 }
 
@@ -71,7 +73,9 @@ const teamName = (m, s) => (team(s) === 0 ? "your team" : "the rivals");
 function deal(m, opening) {
   for (const s of [0, 2, 1, 3]) {                       // personal first; player before companion on the shared deck
     const src = personalSource(m, s);
-    while (src && src.length && m.hands[s].filter((c) => c.origin === "pers").length < 2) m.hands[s].push(src.pop());
+    // a duel: the personal deck replaces the encounter deck, so hands refill toward four from it (D-283; D-1230)
+    const cap = m.kind === "duel" ? 4 : 2;
+    while (src && src.length && m.hands[s].filter((c) => c.origin === "pers").length < cap) m.hands[s].push(src.pop());
   }
   const want = (s) => m.hands[s].filter((c) => c.origin === "enc").length < 4;
   if (opening) {                                         // caller first, then clockwise, one card at a time
@@ -94,7 +98,10 @@ function startTrick(m) {
   if (m.hands.every((h) => !h.length)) return endMatch(m);
   let s = m.leader;
   while (!m.hands[s].length) s = nextSeat(s);            // an empty-handed leader passes the lead on clockwise
-  m.trick = { caller: s, stack: [], turn: s, toPlay: [s], phase: "lead", claim: null, rounds: 1 };
+  // "the next time" / "the next allied Hillfolk card": Covering Fire and Outfitting wait until used, across tricks, for the rest of
+  // the encounter; only effects whose text says "this trick" lapse with it (D-1218)
+  const carry = m.trick ? { ...(m.trick.cover ? { cover: m.trick.cover } : {}), ...(m.trick.outfit ? { outfit: m.trick.outfit } : {}) } : {};
+  m.trick = { caller: s, stack: [], turn: s, toPlay: [s], phase: "lead", claim: null, rounds: 1, ...carry };
 }
 
 // special claim cards (gameplay abilities; a sideways Attrition play disables them, D-102)
@@ -114,8 +121,18 @@ const isHajdu = (e) => !e.horizontal && isMain(e.card) && e.card.suit === "Farmf
  *  or Seven takes it back (Farmfolk Alsó, makk.md); a Hajdú with a Farmfolk X anywhere in the trick holds a protected claim
  *  that only a later Seven overturns (Herd Guard, D-195, D-234); a card played into an Attrition Lock doesn't claim by
  *  matching rank (D-055). */
-export function claimOf(stack) {
+export function claimOf(stack, noAuthority = false) {
   if (!stack.length) return null;
+  // the Bishop and existing protections (D-190 (1), (3), (4); D-193 (1)): Ecclesiastical Authority doesn't take a claim held
+  // under Herd Guard, the Crime Lord's protection or by a Conscript; the claim is worked out without the Authority first (D-1202)
+  if (!noAuthority) {
+    const auth = authorityOf(stack);
+    if (auth) { const base = claimCore(stack, true); return base && base.team !== auth.team && PROTECTED.has(base.reason) ? base : auth; }
+  }
+  return claimCore(stack, noAuthority);
+}
+const PROTECTED = new Set(["Herd Guard", "Protection Racket", "Conscript", "Conscript (Knight's Authority)"]);
+function authorityOf(stack) {
   // Ecclesiastical Authority (Clergy Király, Archbishop): with at least three other Clergy cards in the trick it claims, and
   // nothing played after it overturns that; it applies retroactively when the third Clergy card arrives (piros.md)
   for (let i = 0; i < stack.length; i++) {
@@ -124,12 +141,16 @@ export function claimOf(stack) {
         && stack.filter((x, j) => j !== i && x.card.suit === "Clergy").length >= 3 && !stack.slice(i + 1).some((x) => x.pierce && live(x) && x.card.rank === "VII"))
       return { index: i, seat: e.seat, team: team(e.seat), card: e.card, reason: "Ecclesiastical Authority" };
   }
-  const bottom = stack[0].card;
+  return null;
+}
+function claimCore(stack, noAuthority) {
+  const bottom = stack[0].bike ? { ...stack[0].card, rank: "Király" } : stack[0].card;   // a Bicycle pair leads as a Király (D-780)
   const farmX = stack.some((x) => x.card.suit === "Farmfolk" && x.card.rank === "X");
   // Knight's Authority (King's Men Felső, Knight): a Conscript of the Knight's side can claim despite an EARLIER Seven; a later
   // Seven overrides it normally (D-196)
-  const knights = new Set(stack.filter((x) => live(x) && isMain(x.card) && x.card.suit === "King's Men" && x.card.rank === "Felső" && (x.card.refined || 0) >= 1).map((x) => team(x.seat)));
-  const backed = (e) => isConscript(e) && knights.has(team(e.seat));
+  const knights = new Set(stack.filter((x) => { const k = x.learned || x.card; return live(x) && isMain(k) && k.suit === "King's Men" && k.rank === "Felső" && (k.refined || 0) >= 1; }).map((x) => team(x.seat)));   // x.learned: an apprentice's copied Felső (D-532)
+  // Knight's Authority backs a friendly Farmfolk Conscript only (D-294; royal.md), not an Alpha or a Toportyán (D-1204)
+  const backed = (e) => isConscript(e) && e.card.suit === "Farmfolk" && knights.has(team(e.seat));
   // Crew Command (Vajda): every other allied Fisherfolk face card claims whatever its rank, by normal resolution (D-380)
   const vajdas = stack.filter((x) => live(x) && !x.silenced && isMain(x.card) && x.card.suit === "Fisherfolk" && x.card.rank === "Király" && (x.card.refined || 0) >= 1);
   const crew = (e) => ["Alsó", "Felső", "Király", "Ász"].includes(e.card.rank) && e.card.suit === "Fisherfolk" && live(e) && vajdas.some((v) => v !== e && team(v.seat) === team(e.seat));
@@ -142,6 +163,9 @@ export function claimOf(stack) {
   const blocked = (i) => i === stack.length - 1 && i >= 1 && (ten(stack[i - 1]) || (stack[i - 1].card.suit === "Beasts" && stack.slice(0, i - 1).some((x) => ten(x) && x.tenacious.ebborz)));
   // Arbitration / Mesmerise (D-615, D-627): a kept claim stands against the cards in the trick when it was kept
   let who = first < 0 || stack[first].discon || stack[first].falseClaim || (cutBy(stack[first]) && !stack[first].keep) ? -1 : first, guarded = false, shield = bottom.rank === "VII" && isEnforcer(stack[0]) && !stack[0].silenced, how = "led card";
+  // Herd Guard "regardless of order or bottom card" (makk.md): a led Hajdú with a Farmfolk X in the trick holds a protected claim
+  // too (D-1212)
+  if (who >= 0 && isHajdu(stack[who]) && !stack[who].suppressed && !stack[who].silenced && farmX) { guarded = true; how = "Herd Guard"; }
   for (let i = Math.max(1, first + 1); i < stack.length; i++) {
     const e = stack[i], c = e.card;
     if (e.tower || e.inserted) continue;                   // Erection's tower, a horse's inserted cards: no claims
@@ -155,9 +179,9 @@ export function claimOf(stack) {
     const bl = blocked(i);
     if (bl && !(c.rank === bottom.rank && !e.noClaim)) continue;   // Tenacious lets only a matching rank through (D-909)
     // an Archbishop silenced by Defiance keeps the claim it had, as an ordinary claim (D-627)
-    if (isMain(c) && c.suit === "Clergy" && c.rank === "Király" && (c.refined || 0) >= 1 && live(e) && stack.filter((x, j) => j !== i && x.card.suit === "Clergy").length >= 3) { who = i; how = e.silenced ? "Ecclesiastical Authority (defied)" : "Ecclesiastical Authority"; continue; }
+    if (!noAuthority && isMain(c) && c.suit === "Clergy" && c.rank === "Király" && (c.refined || 0) >= 1 && live(e) && stack.filter((x, j) => j !== i && x.card.suit === "Clergy").length >= 3) { who = i; how = e.silenced ? "Ecclesiastical Authority (defied)" : "Ecclesiastical Authority"; continue; }
     // Written Protection (Prepared Parchment): the protected Clergy claim can't be taken by the other side this round (D-571)
-    const holder = who >= 0 ? stack[who] : {}, walled = holder.prot && live(holder) && !holder.silenced && team(e.seat) !== team(holder.seat);
+    const holder = who >= 0 ? stack[who] : {}, walled = (holder.prot || holder.guard) && live(holder) && !holder.silenced && team(e.seat) !== team(holder.seat);
     // Stubborn Roots (Hulled Millet): another commodity can't take its claim (D-560)
     const rooted = holder.roots === "keep" && live(holder) && !holder.silenced && (c.rank === "VIII" || c.rank === "X");
     if (walled || rooted) continue;
@@ -167,9 +191,12 @@ export function claimOf(stack) {
     // as whichever allowed face rank takes it (D-742)
     // Lekking claims as the copied rank, as a Seven when it copies a VII (D-521)
     const rk = (live(e) && e.claimRank) || c.rank;
-    const matching = !e.noClaim && (c.rank === bottom.rank || (!bl && (rk === bottom.rank || (isDoll(e) && dollRanks(e).includes(bottom.rank)) || crew(e))));
+    const corrMatch = c.suit === "Corruption" && bottom.suit === "Corruption" && c.corr !== "peter" && bottom.corr !== "peter";
+    const matching = !e.noClaim && (corrMatch || c.rank === bottom.rank || (!bl && (rk === bottom.rank || (isDoll(e) && dollRanks(e).includes(bottom.rank)) || crew(e))));
     if (rk === "VII" && (c.rank === "VII" || !bl)) {
-      if (shield) { shield = false; continue; }
+      // Superior Equipment blocks a Seven only when the capture target is a Seven (your ruling, 2026-11-20: "no 7 is blocked, unless
+      // the capture target card is a 7"; D-1203)
+      if (shield && bottom.rank === "VII") { shield = false; continue; }
       who = i; guarded = isHajdu(e) && !e.suppressed && !e.silenced && farmX; shield = isEnforcer(e) && !e.silenced;   // Silence ends protections (D-641)
       how = guarded ? "Herd Guard" : bottom.rank === "VII" ? "matching rank" : "Seven"; continue;
     }
@@ -177,7 +204,7 @@ export function claimOf(stack) {
     if (e.racket && live(e) && !e.silenced && !bl) { who = i; shield = false; how = "Protection Racket"; continue; }   // Crime Lord (thug.md)
     if (matching) { who = i; shield = false; how = c.rank === bottom.rank || rk === bottom.rank ? "matching rank" : crew(e) ? "Crew Command" : "matching rank"; continue; }   // a matching card bypasses the equipment
     // a granted Conscript ability (To Arms!) claims the same way, but isn't a Farmfolk Conscript for Knight's Authority (D-631)
-    if (!bl && (isConscript(e) || (e.conscripted && live(e))) && (who < 0 || stack[who].card.rank !== "VII" || backed(e))) { who = i; shield = false; how = backed(e) ? "Conscript (Knight's Authority)" : "Conscript"; }
+    if (!bl && (isConscript(e) || (e.conscripted && live(e))) && (!stack.slice(0, i).some((x) => !x.horizontal && (x.card.rank === "VII" || (live(x) && x.claimRank === "VII"))) || backed(e))) { who = i; shield = false; how = backed(e) ? "Conscript (Knight's Authority)" : "Conscript"; }
   }
   // Disconcerting's dead end: nothing can claim, so the caller takes the trick (D-511)
   const cs = stack.find((x) => x.callerSeat !== undefined);
@@ -190,15 +217,15 @@ export function claimOf(stack) {
 }
 
 /** would this card take the claim if played now? (D-238: continuation legality is claim-based, abilities included) */
-export function claims(stack, c) {
+export function claims(stack, c, seat = 0) {   // the seat matters: team-dependent rules (protections, Crew Command, Knights) (D-1228)
   if (!stack.length) return true;
-  return claimOf([...stack, { seat: 0, card: c }]).index === stack.length;
+  return claimOf([...stack, { seat, card: c }]).index === stack.length;
 }
 // the same for a given seat, honouring a Lock that binds that seat's turn (D-055: a Seven still captures)
 function claimsFor(m, seat, c) {
   const t = m.trick;
   if (t.lock && t.lock.seat === seat && c.rank === t.stack[0]?.card.rank && c.rank !== "VII") return false;
-  return claims(t.stack, c);
+  return claims(t.stack, c, seat);
 }
 
 // ---------------------------------------------------------------- Attrition (D-053 to D-056, D-101 to D-103, D-215, D-304, D-313 to D-316)
@@ -206,7 +233,7 @@ export const ATTRITION = {
   VII: "Draw Two: the next player draws two and loses their turn, unless they pass it on with their own Attrition Seven",
   VIII: "Double Play: play one more card at once",
   IX: "Rank Request: the next player must play the rank you name, or draw one and lose their turn",
-  X: "Lock: when this X is the card to match, the next player can't take it with an X (a Seven still can)",
+  X: "Lock: the next player can't take the card to match with a card of its rank (a Seven still can)",
   "Alsó": "Face-Card Request: the next player must play an Alsó, Felső, Király or Ász, or draw one and lose their turn",
   "Felső": "Suit Request: the next player must play the suit you name, or draw one and lose their turn",
   "Király": "Cancel: ends any Attrition effect in play",
@@ -215,48 +242,76 @@ export const ATTRITION = {
 const FACE = new Set(["Alsó", "Felső", "Király", "Ász"]);                // D-304
 const complies = (p, c) => p.kind === "rank" ? c.rank === p.value : p.kind === "suit" ? c.suit === p.value : p.kind === "face" ? FACE.has(c.rank) : true;
 const playAct = (c) => ({ type: "play", card: c, canHorizontal: !!c.attrition });
+const ar = (c) => c.attrRank || c.rank;
+const drawable = (a) => a.filter((c) => c.corr !== "glitched");
+// the Bicycle (Corruption, D-780): never played alone; it goes down together with an Alsó, Felső or Ász in the same turn, and the
+// pair counts as one Király until the end of the trick (reading, D-780: one play for both); the paired card scores as normal
+const isBike = (c) => c.corr === "bicycle";
+const BIKE_MATES = new Set(["Alsó", "Felső", "Ász"]);
+function withBikes(hand, acts) {
+  const bike = hand.find(isBike), out = acts.filter((a) => !isBike(a.card));
+  if (bike) for (const a of acts) if (BIKE_MATES.has(a.card.rank) && !a.mustHorizontal) out.push({ type: "play", card: a.card, with: bike, canHorizontal: false });
+  return out;
+}   // a glitched Corruption card is never drawn (D-751)                    // a stray UNO card's sideways ability (Corruption, D-754)
 
 // Carnivalfolk play constraints (carnival.md), each "if able": Hear Ye! (play the announced suit), Right of Way (a suit other
 // than the card beneath the Travel Pass), Intimidation (one of your highest-value cards)
-function constrain(m, s, cards) {
+// Conflicting forced plays (D-522, D-523): the effect binding more players takes precedence; on a tie the one that started earlier.
+// Each is applied "if able", in that order, so a later one only narrows within what the stronger ones left. An effect's start is
+// stamped when the engine first sees it (the legal-move check right after the card that set it)
+function constrain(m, s, cards, req = null) {
   let out = cards;
   const narrow = (pred) => { const k = out.filter(pred); if (k.length) out = k; };
-  if (m.hearYe && m.hearYe.by !== s) narrow((c) => c.suit === m.hearYe.suit);
-  if (m.rightOfWay && m.rightOfWay.by !== s) narrow((c) => c.suit !== m.rightOfWay.suit);
-  // Lekking (Túzok): the next player must play an Ász if able; Intimidation, binding more players, takes precedence (D-522)
-  if (m.lek && m.lek.seat === s && !(m.intimidate && m.intimidate.by !== s)) narrow((c) => c.rank === "Ász");
-  if (m.intimidate && m.intimidate.by !== s) {
-    const top = Math.max(...out.map((c) => m.value(c))); narrow((c) => m.value(c) === top);
-  }
+  const stamp = (x) => (x.at ??= (m.cseq = (m.cseq || 0) + 1));
+  const live = [];
+  if (m.hearYe && m.hearYe.by !== s) live.push({ x: m.hearYe, scope: 3, apply: () => narrow((c) => c.suit === m.hearYe.suit) });   // every later player
+  if (m.rightOfWay && m.rightOfWay.by !== s) live.push({ x: m.rightOfWay, scope: 1, apply: () => narrow((c) => c.suit !== m.rightOfWay.suit) });   // the next player
+  if (m.lek && m.lek.seat === s) live.push({ x: m.lek, scope: 1, apply: () => narrow((c) => c.rank === "Ász") });   // Lekking (Túzok): the next player
+  if (m.intimidate && m.intimidate.by !== s) live.push({ x: m.intimidate, scope: m.intimidate.once ? 1 : 3,
+    apply: () => { const top = Math.max(...out.map((c) => m.value(c))); narrow((c) => m.value(c) === top); } });
+  // an Attrition request is one of these forced plays, binding one player (your answer, D-1247): ranked with them by D-522
+  if (req) live.push({ x: req, scope: 1, apply: () => narrow((c) => complies(req, c)) });
+  for (const e of live) stamp(e.x);
+  live.sort((a, b) => b.scope - a.scope || a.x.at - b.x.at);
+  // the stronger effect wins a conflict: a weaker one that would leave no card the stronger allows is dropped (narrow keeps out)
+  for (const e of live) e.apply();
   return out;
 }
 /** whose decision is it and what may they do */
 export function legal(m) {
   if (m.ended) return { seat: null, actions: [] };
   const t = m.trick, s = t.turn, hand = m.hands[s], p = m.pending && m.pending.seat === s ? m.pending : null;
-  if (t.extra === s) return { seat: s, kind: "extra", actions: constrain(m, s, hand).map(playAct) };   // Double Play
+  if (t.extra === s) return { seat: s, kind: "extra", actions: withBikes(hand, constrain(m, s, hand).map(playAct)) };   // Double Play
   if (p && !(t.phase === "continue" && ["rank", "suit", "face"].includes(p.kind))) {                 // D-316: continuations unbound
     if (p.kind === "draw") return { seat: s, kind: "penalty", pending: p, actions: [
-      ...hand.filter((c) => c.attrition && (c.rank === "VII" || c.rank === "Király")).map((c) => ({ type: "play", card: c, mustHorizontal: true, canHorizontal: true })),
+      ...hand.filter((c) => c.attrition && (ar(c) === "VII" || ar(c) === "Király")).map((c) => ({ type: "play", card: c, mustHorizontal: true, canHorizontal: true })),
       { type: "penalty", draw: p.count }] };
     if (p.kind === "skip") return { seat: s, kind: "penalty", pending: p, actions: [
-      ...hand.filter((c) => c.attrition && (c.rank === "Ász" || c.rank === "Király")).map((c) => ({ type: "play", card: c, mustHorizontal: true, canHorizontal: true })),
+      ...hand.filter((c) => c.attrition && (ar(c) === "Ász" || ar(c) === "Király")).map((c) => ({ type: "play", card: c, mustHorizontal: true, canHorizontal: true })),
       { type: "penalty", draw: 0 }] };
-    const ok = hand.filter((c) => complies(p, c) && (t.phase !== "continue" || claimsFor(m, s, c)));
-    if (ok.length) return { seat: s, kind: t.phase, pending: p, actions: ok.map(playAct) };
-    return { seat: s, kind: "penalty", pending: p, actions: [{ type: "penalty", draw: 1 }] };
+    // no card meets the request: draw one and lose the turn; otherwise the request ranks with the other forced plays (D-522,
+    // D-523): a stronger one that leaves no complying card drops it (your answer, D-1247)
+    const base = hand.filter((c) => !isBike(c) && (t.phase !== "continue" || claimsFor(m, s, c)));
+    if (!base.some((c) => complies(p, c))) return { seat: s, kind: "penalty", pending: p, actions: [{ type: "penalty", draw: 1 }] };
+    return { seat: s, kind: t.phase, pending: p, actions: constrain(m, s, base, p).map(playAct) };
   }
-  if (t.phase === "lead" || t.phase === "respond") return { seat: s, kind: t.phase, actions: constrain(m, s, hand).map(playAct) };
+  if (t.phase === "lead" || t.phase === "respond") return { seat: s, kind: t.phase, actions: withBikes(hand, constrain(m, s, hand).map(playAct)) };
   if (t.phase === "continue") {                          // the caller: continue with a claiming card, or Pass (D-217, D-238, D-239)
     // Hear Ye!, Right of Way and Intimidation bind this turn too, "if able" among the claiming cards (your ruling, 2026-11-04;
     // D-238: continuation legality accounts for restrictions)
-    const opts = constrain(m, s, hand.filter((c) => claimsFor(m, s, c))).map(playAct);
+    const opts = constrain(m, s, hand.filter((c) => !isBike(c) && claimsFor(m, s, c))).map(playAct);
     return { seat: s, kind: "continue", actions: [...opts, { type: "pass" }] };
   }
   return { seat: null, actions: [] };
 }
 
-export function act(m, seat, action) {
+/** cards that entered a hand since the last action meet the onHand hook, in seat and hand order (deterministic) */
+function enterHands(m) {
+  if (!m.onHand) return;
+  for (let s = 0; s < 4; s++) for (const c of m.hands[s]) if (!c.entered) { c.entered = true; m.onHand(m, s, c); }
+}
+export function act(m, seat, action) { try { return actInner(m, seat, action); } finally { enterHands(m); } }
+function actInner(m, seat, action) {
   const L = legal(m);
   if (seat !== L.seat) throw new Error(`not seat ${seat}'s turn`);
   const t = m.trick;
@@ -274,14 +329,15 @@ export function act(m, seat, action) {
     return advance(m, seat);
   }
   const c = m.hands[seat].find((x) => x.id === action.card.id);
-  const la = c && L.actions.find((a) => a.type === "play" && a.card.id === c.id);
+  const la = c && L.actions.find((a) => a.type === "play" && a.card.id === c.id && (a.with?.id ?? null) === (action.with?.id ?? null));
   if (!la) throw new Error("illegal card");
   const horizontal = !!(action.horizontal || la.mustHorizontal);
   if (horizontal && !c.attrition) throw new Error("this card has no Attrition upgrade (D-101)");
   const facing = m.pending && m.pending.seat === seat ? m.pending : null;
   m.hands[seat].splice(m.hands[seat].indexOf(c), 1);
+  if (la.with) m.hands[seat].splice(m.hands[seat].indexOf(la.with), 1);       // the Bicycle goes down with it
   if (t.phase === "continue") t.rounds = (t.rounds || 1) + 1;   // the caller's continuation starts a new round
-  const entry = { seat, card: c, horizontal };
+  const entry = { seat, card: c, horizontal, ...(la.with ? { claimRank: "Király", bike: la.with } : {}) };
   if (t.lock && t.lock.seat === seat && c.rank === t.stack[0]?.card.rank && c.rank !== "VII") entry.noClaim = true;
   t.stack.push(entry);
   // Carnivalfolk constraints end: Hear Ye! and a Dancing Bear when play comes back to their player; Right of Way and a
@@ -296,7 +352,10 @@ export function act(m, seat, action) {
   if (t.anotherRound != null && t.anotherRound !== seat) { t.anotherRound = null; if (m.hands[seat].length) { t.extra = seat; say(m, `Another Round! ${m.names[seat]} must play one more card.`); } }
   const cl = claimOf(t.stack); t.claim = cl;
   say(m, `${V(m, seat, "plays", "play")} ${c.name ? c.name + ` (${c.rank} of ${c.suit})` : `${c.rank} of ${c.suit}`}${c.origin === "pers" ? " from the personal deck" : ""}${horizontal ? " sideways (Attrition)" : ""}${cl && cl.seat === seat && t.stack.length > 1 && !t.lost ? ` and ${seat === 0 ? "take" : "takes"} the claim (${cl.reason})` : ""}${entry.noClaim ? ", but the Lock stops it claiming" : ""}.`);
-  if (m.onPlay && !horizontal) m.onPlay(m, seat, c);                     // a sideways play doesn't use the card's Trick Ability (D-101)
+  if (la.with) say(m, `…on a Bicycle: the pair counts as one Király until the end of the trick.`);
+  // a sideways play doesn't use the card's own Trick Ability (D-101), but the other cards' reactions and orientation-free
+  // effects still see it (D-103; D-1229): the hook runs, and skips the card's own trick ability
+  if (m.onPlay) m.onPlay(m, seat, c);
   t.claim = claimOf(t.stack);
   let next = null;
   if (horizontal) next = attrition(m, seat, c, action, facing);
@@ -314,21 +373,30 @@ export function act(m, seat, action) {
 
 function attrition(m, seat, c, action, facing) {
   const t = m.trick;
-  switch (c.rank) {
+  switch (ar(c)) {
     case "VII": { const n = (facing?.kind === "draw" ? facing.count : 0) + 2; say(m, `Draw Two${n > 2 ? `, stacked to ${n}` : ""}!`); return { kind: "draw", count: n }; }
     case "VIII": say(m, "Double Play: another card at once."); t.extra = seat; return null;
     case "IX": { const r = action.request || "Ász"; say(m, `Rank Request: ${r}.`); return { kind: "rank", value: r }; }
-    case "X": if (t.stack.length === 1) { say(m, "Lock: no X may take this X on the next turn."); return { lock: true, kind: "lockonly" }; } say(m, "Lock has no effect here: this X isn't the card to match."); return null;
+    // Lock protects the current capture target, whatever its rank, for the next player's turn (D-055; R-03; D-1227)
+    case "X": { const tg = t.stack[0]?.card.rank; say(m, `Lock: no ${tg || "X"} may take the card to match on the next turn (a Seven still can).`); return { lock: true, kind: "lockonly", value: tg }; }
     case "Alsó": say(m, "Face-Card Request."); return { kind: "face" };
-    case "Felső": { const su = action.request || c.suit; say(m, `Suit Request: ${su}.`); return { kind: "suit", value: su }; }
+    case "Felső": { let su = action.request || c.suit;   // Corruption can never be named as a suit (card-system.md; D-1234)
+      if (su === "Corruption") su = (t.stack.find((x) => x.card.suit !== "Corruption") || {}).card?.suit || (m.suits || ["Farmfolk"])[0];
+      say(m, `Suit Request: ${su}.`); return { kind: "suit", value: su }; }
     case "Király": m.pending = null; t.lock = null; say(m, "Cancel: Attrition effects end."); return null;
     case "Ász": say(m, facing?.kind === "skip" ? "Skip, passed on!" : "Skip!"); return { kind: "skip" };
+    case "monster": {                                      // Summoned Monster sideways: your side's claim can't be taken this trick (D-1190)
+      const cl = claimOf(t.stack.slice(0, -1)); const h = cl && t.stack[cl.index];
+      if (h && team(h.seat) === team(seat)) { h.guard = true; say(m, "The Summoned Monster stands guard: your side's claim can't be taken for the rest of the trick."); }
+      else say(m, "The Summoned Monster has no claim of your side's to guard.");
+      return null;
+    }
   }
   return null;
 }
 function pendingText(p) {
   return { draw: `must draw ${p.count} and lose the turn, unless they pass it on`, skip: "loses the turn", rank: `must play a ${p.value}, or draw one and lose the turn`,
-           face: "must play a face card, or draw one and lose the turn", suit: `must play a ${p.value} card, or draw one and lose the turn`, lockonly: "can't take the X with an X this turn" }[p.kind] || "";
+           face: "must play a face card, or draw one and lose the turn", suit: `must play a ${p.value} card, or draw one and lose the turn`, lockonly: `can't take the card to match with a matching rank this turn` }[p.kind] || "";
 }
 
 function advance(m, seat) {
@@ -337,14 +405,17 @@ function advance(m, seat) {
   let s = nextSeat(seat);
   while (s !== t.caller && !m.hands[s].length) s = nextSeat(s);
   if (s !== t.caller) { t.turn = s; t.phase = "respond"; return; }
+  // every round's end, an extra round included: round-end effects (Forewarning) and Bottom Feeding's return come first (D-650,
+  // D-652; D-1204)
+  if (t.roundEnd) t.roundEnd = t.roundEnd.filter((f) => !f(m));
+  for (const f of t.fed || []) t.stack.splice(Math.min(f.depth, t.stack.length), 0, f.entry); t.fed = null;
   // By Royal Decree! (King's Men IX, Royal): the trick gets one more full round of four plays from the original starter
   if (t.decree && !t.decreeDone) {
     t.decreeDone = true; t.rounds = (t.rounds || 1) + 1; let f = t.caller, k = 0;
     while (!m.hands[f].length && k++ < 4) f = nextSeat(f);
     if (m.hands[f].length) { t.turn = f; t.phase = "respond"; say(m, "By Royal Decree! Another round of plays."); return; }
   }
-  // Forewarning: at the end of the round after the Recluse's, Hillfolk cards above the card to match move to the top, random order
-  if (t.roundEnd) t.roundEnd = t.roundEnd.filter((f) => !f(m));   // round-end effects (Forewarning); a hook returning true is done
+  // (Forewarning: at the end of the round after the Recluse's, Hillfolk cards above the card to match move to the top; run above)
   // Final Nail, Cash Out (the trick ends with this round) and Let It Ride (the caller must start another); the later card decides;
   // By Royal Decree!'s extra round above comes first (D-588, D-656)
   const rule = t.roundRule; t.roundRule = null;
@@ -354,8 +425,7 @@ function advance(m, seat) {
     if (m.hands[f].length) { t.rounds += 1; t.turn = f; t.phase = "respond"; say(m, "Let It Ride: another round, like it or not."); return; }
     return resolveTrick(m);
   }
-  // Bottom Feeding's cards come back before the next round (D-650)
-  for (const f of t.fed || []) t.stack.splice(Math.min(f.depth, t.stack.length), 0, f.entry); t.fed = null;
+  // (Bottom Feeding's cards came back above, before any next round, D-650)
   // back at the caller: continuation possible only with a claiming card (D-238)
   t.turn = t.caller;
   if (m.hands[t.caller].some((c) => claimsFor(m, t.caller, c)) || (m.pendingNext && (m.pendingNext.kind === "draw" || m.pendingNext.kind === "skip"))) t.phase = "continue";
@@ -372,34 +442,34 @@ function resolveTrick(m) {
   for (const p of t.pilfered || []) { if (p.top) t.stack.push(p.entry); else t.stack.splice(Math.min(p.depth, t.stack.length), 0, p.entry);
     say(m, `The fox drops the ${p.entry.card.name || p.entry.card.rank + " of " + p.entry.card.suit} back ${p.top ? "on top" : "where it was"}.`); }
   t.pilfered = null;
-  const cl = claimOf(t.stack);
-  if (m.onTrick) m.onTrick(m, t.stack, cl);
+  let cl = claimOf(t.stack);
+  if (m.onTrick) cl = m.onTrick(m, t.stack, cl) || cl;    // end-of-trick effects may change the winner (Conversion, D-193)
   // the truffle-summoned Tusker wins (D-187, D-211): nobody captures; Great Escape and Resurrection still act; the encounter cards
   // are discarded for good; personal cards return as transient; the next lead is random among the four
   if (cl.seat < 0) {
     for (const x of t.stack) if (x.resurrect && x.card.origin === "enc") m.deck.splice(Math.floor(m.rng.next() * (m.deck.length + 1)), 0, x.card);
     for (const x of t.stack) if (x.escape) m.hands[x.seat].push(x.card);
     for (const h of m.hands) for (let k = h.length - 1; k >= 0; k--) if (h[k].vanish) h.splice(k, 1);
-    for (const x of t.stack) if (x.card.origin === "pers" && !x.escape) returnPersonal(m, x.card);
+    for (const x of t.stack) if (x.card.origin === "pers" && !x.escape) { returnPersonal(m, x.card); m.playUsed?.delete(x.card.id); }   // back to its deck: reset (D-058)
     m.tricksDone += 1;
     say(m, `Trick ${m.tricksDone}: the Tusker wins it, and the trick is lost to everyone.`);
     m.lastTrick = { stack: t.stack, winner: -1, team: -1 }; m.history.push(m.lastTrick);
-    m.command = null; m.pending = null; m.leader = Math.floor(m.rng.next() * 4);
+    m.command = null; m.command1 = null; m.pending = null; m.leader = Math.floor(m.rng.next() * 4);
     if (m.finalTrick || m.tricksDone >= m.trickLimit) return endMatch(m);
     deal(m, false); return startTrick(m);
   }
-  for (const x of t.stack) if (x.resurrect && x.card.origin === "enc") m.deck.splice(Math.floor(m.rng.next() * (m.deck.length + 1)), 0, x.card);   // Resurrection
+  for (const x of t.stack) if (x.resurrect && x.card.origin === "enc") { m.deck.splice(Math.floor(m.rng.next() * (m.deck.length + 1)), 0, x.card); m.playUsed?.delete(x.card.id); }   // Resurrection: back to its deck, reset (D-058)
   for (const x of t.stack) if (x.escape) m.hands[x.seat].push(x.card);   // Great Escape: back to the player's hand
   const enc = t.stack.filter((x) => x.card.origin === "enc" && !x.resurrect && !x.escape).map((x) => x.card);
   m.captured[cl.team].push(...enc);                      // encounter cards are the spoils; personal cards are transient
   if (m.capturedBySeat) m.capturedBySeat[cl.seat].push(...enc);   // a shared match: the winning seat keeps them (D-914)
   for (const h of m.hands) for (let k = h.length - 1; k >= 0; k--) if (h[k].vanish) h.splice(k, 1);   // Raise the Alarm's unplayed Volunteer (D-614)
-  for (const x of t.stack) if (x.card.origin === "pers" && !x.escape) returnPersonal(m, x.card);
+  for (const x of t.stack) if (x.card.origin === "pers" && !x.escape) { returnPersonal(m, x.card); m.playUsed?.delete(x.card.id); }   // back to its deck: reset (D-058)
   m.tricksDone += 1;
   say(m, `Trick ${m.tricksDone} to ${teamName(m, cl.seat)} (${m.names[cl.seat]}, ${cl.reason}): ${enc.length} encounter card${enc.length === 1 ? "" : "s"}${enc.some(isZsir) ? `, ${enc.filter(isZsir).length * 10} points` : ""}.`);
   m.lastTrick = { stack: t.stack, winner: cl.seat, team: cl.team };
   m.history.push(m.lastTrick);
-  m.command = null; m.pending = null;                     // Attrition effects don't outlast the trick
+  m.command = null; m.command1 = null; m.pending = null;                     // Attrition effects don't outlast the trick
   m.leader = cl.seat;                                     // the winner leads next (D-201)
   if (m.finalTrick || m.tricksDone >= m.trickLimit) return endMatch(m);
   deal(m, false);
@@ -457,30 +527,32 @@ function withAttrition(m, seat, ch) {
   if (ch.type !== "play" || !ch.card.attrition) return ch;
   const t = m.trick; let nx = nextSeat(seat); while (nx !== seat && !m.hands[nx].length) nx = nextSeat(nx);
   if (team(nx) === team(seat)) return ch;
-  const r = ch.card.rank;
+  const r = ar(ch.card);
   if (r === "IX") return { ...ch, horizontal: true, request: "Ász" };
   if (r === "Felső") { const have = new Set(m.hands[seat].map((c) => c.suit)); const su = ["Farmfolk", "Clergy", "Forestfolk", "Tradesfolk", "Plainsfolk", "Townsfolk", "Bandits", "Beasts"].find((x) => !have.has(x)) || ch.card.suit; return { ...ch, horizontal: true, request: su }; }
   if (["VII", "Alsó", "Ász"].includes(r)) return { ...ch, horizontal: true };
-  if (r === "X" && t.stack.length === 0) return { ...ch, horizontal: true };   // lead an X under Lock
+  if (r === "X" && (t.stack.length === 0 || claimOf(t.stack)?.team === seat % 2)) return { ...ch, horizontal: true };   // Lock: lead an X under it, or guard your side's claim (D-055)
   return ch;
 }
 
 function aiChooseInner(m, seat) {
   const own = baseChoice(m, seat);
-  if (seat !== 2 || !m.command || m.ended) return own;
-  const f = followCommand(m, seat, own);
-  if (f && (f.type !== own.type || f.card !== own.card)) say(m, `${m.names[2]} follows your call.`);
+  // each side's AI partner follows its own side's call: seat 2 the player's (m.command), seat 3 the other side's (m.command1) (D-409; D-1232)
+  const cmd = seat === 2 ? m.command : seat === 3 ? m.command1 : null;
+  if (!cmd || m.ended) return own;
+  const f = followCommand(m, seat, own, cmd);
+  if (f && (f.type !== own.type || f.card !== own.card)) say(m, `${m.names[seat]} follows ${seat === 2 ? "your" : "the"} call.`);
   return f || own;
 }
 
 // the AI partner follows a request when it legally can (D-409: it may also ignore it; here it ignores only what it can't do)
-function followCommand(m, seat, own) {
+function followCommand(m, seat, own, cmd) {
   const L = legal(m), t = m.trick, hand = m.hands[seat];
   const plays = L.actions.filter((a) => a.type === "play").map((a) => a.card);
   const cl = t.stack.length ? claimOf(t.stack) : null, ours = cl && cl.team === team(seat);
   const pick = (cs) => cs.slice().sort((x, y) => m.value(x) - m.value(y))[0];
-  const takes = plays.filter((c) => t.stack.length && claims(t.stack, c));
-  switch (m.command) {
+  const takes = plays.filter((c) => t.stack.length && claims(t.stack, c, seat));
+  switch (cmd) {
     case "add": { const z = plays.filter(isZsir); if (ours && z.length && L.kind !== "continue") return { type: "play", card: z[0] }; return null; }
     case "noadd": if (own.type === "play" && isZsir(own.card)) { const o = plays.filter((c) => !isZsir(c)); return o.length ? { type: "play", card: pick(o) } : null; } return null;
     case "hold":
@@ -489,7 +561,7 @@ function followCommand(m, seat, own) {
       return null;
     case "nohold":
       if (L.kind === "continue") return { type: "pass" };
-      if (L.kind === "respond") { const o = plays.filter((c) => !claims(t.stack, c) && !isZsir(c)); return o.length ? { type: "play", card: pick(o) } : null; }
+      if (L.kind === "respond") { const o = plays.filter((c) => !claims(t.stack, c, seat) && !isZsir(c)); return o.length ? { type: "play", card: pick(o) } : null; }
       return null;
   }
   return null;
@@ -500,7 +572,7 @@ function baseChoice(m, seat) {
   const plays = L.actions.filter((a) => a.type === "play").map((a) => a.card);
   const isVII = (c) => c.rank === "VII";
   const cheapest = (cs) => cs.slice().sort((x, y) => (isZsir(x) - isZsir(y)) || (isVII(x) - isVII(y)) || (m.value(x) - m.value(y)))[0];
-  const shed = () => cheapest(plays.filter((c) => !isZsir(c) && !isVII(c) && !claims(t.stack, c)))
+  const shed = () => cheapest(plays.filter((c) => !isZsir(c) && !isVII(c) && !claims(t.stack, c, seat)))
                   || cheapest(plays.filter((c) => !isZsir(c) && !isVII(c))) || cheapest(plays.filter((c) => !isZsir(c))) || cheapest(plays);
   if (L.kind === "lead") {                               // lead a rank we hold twice (we can defend it), else a cheap card
     const pair = plays.find((c) => !isZsir(c) && !isVII(c) && hand.some((d) => d !== c && d.rank === c.rank));
@@ -513,7 +585,7 @@ function baseChoice(m, seat) {
   const cargoWorth = team(seat) === 0 ? t.stack.filter((x) => x.card.origin === "enc" && want(x.card)).length * 5 : 0;
   const worth = points + cargoWorth;
   const lastChance = m.finalTrick || m.tricksDone >= m.trickLimit - 1;   // cards still in hand after this trick are wasted
-  const natural = plays.filter((c) => claims(t.stack, c) && !isVII(c)), sevens = plays.filter((c) => claims(t.stack, c) && isVII(c));
+  const natural = plays.filter((c) => claims(t.stack, c, seat) && !isVII(c)), sevens = plays.filter((c) => claims(t.stack, c, seat) && isVII(c));
   // take it back from the other side? a natural card for anything worth having; a Seven only for points (or the last trick)
   const retake = () => (worth > 0 && natural.length) ? natural[0]
                      : (sevens.length && (points > 0 || (lastChance && worth > 0))) ? sevens[0] : null;
@@ -553,23 +625,23 @@ function retakeRisk(m, seat) {
 /** The location's encounter deck is its four suits' complete sets, 32 cards (D-391, D-406). The two NPC opponents each
  *  bring a full-rank personal deck of a suit of the location (D-450; Region 1: unupgraded). The companion plays from the
  *  player's personal deck (D-153). */
-export function locationMatch({ rng, suits, playerPersonal, value, trickLimit, names, onPlay, onTrick, deckCard, partner, opponents, wanted, seats, companion }) {
-  const deck = suits.flatMap((suit) => ZSIR_RANKS.map((rank) => { const x = deckCard ? deckCard(rank, suit) : {}; return card(rank, suit, x.refined || x.adjective || !DECK_UP ? x : { ...x, ...DECK_UP(rank, suit, x) }); }));
+export function locationMatch({ rng, suits, playerPersonal, value, trickLimit, names, onPlay, onTrick, deckCard, partner, opponents, wanted, seats, companion, extra = [] }) {
+  const deck = extra.map((x) => card(x.rank, x.suit, x)).concat(suits.flatMap((suit) => ZSIR_RANKS.map((rank) => { const x = deckCard ? deckCard(rank, suit) : {}; return card(rank, suit, x.refined || x.adjective || !DECK_UP ? x : { ...x, ...DECK_UP(rank, suit, x) }); })));
   // opponents: given (a POI's NPCs after negotiation) or two locals of the location's suits; a POI partner brings its own deck
   const npcSuits = opponents || [rng.pick(suits), rng.pick(suits)];
   const npcDeck = (suit) => ZSIR_RANKS.map((rank) => npcCard(rank, suit));
   // a match shared with other caravans (D-408, D-425, D-914): seats 1-3 given (a caravan's own personal deck or an NPC local);
   // each seat keeps what it captures
   if (seats) {
-    const deckOf = (sv) => (sv.deck ? sv.deck.map((c) => card(c.rank, c.suit, { ...c, ref: c })) : npcDeck(sv.suit));
+    const deckOf = (sv) => (sv.deck ? drawable(sv.deck).map((c) => card(c.rank, c.suit, { ...c, ref: c })) : npcDeck(sv.suit));
     const m = newMatch({ rng, encounterDeck: deck, value, trickLimit, onPlay, onTrick, wanted, suits,
-      personal: [playerPersonal.map((c) => card(c.rank, c.suit, { ...c, ref: c })), deckOf(seats[1]), deckOf(seats[2]), deckOf(seats[3])],
+      personal: [drawable(playerPersonal).map((c) => card(c.rank, c.suit, { ...c, ref: c })), deckOf(seats[1]), deckOf(seats[2]), deckOf(seats[3])],
       names: ["You", seats[1].name, seats[2].name, seats[3].name] });
     m.shared = seats; m.capturedBySeat = [[], [], [], []];
     return m;
   }
   return newMatch({ rng, encounterDeck: deck, value, trickLimit, onPlay, onTrick, wanted, suits,
-    personal: [playerPersonal.map((c) => card(c.rank, c.suit, { ...c, ref: c })), npcDeck(npcSuits[0]), partner ? npcDeck(partner) : companion ? mercCards(companion.deck) : null, npcDeck(npcSuits[1])],
+    personal: [drawable(playerPersonal).map((c) => card(c.rank, c.suit, { ...c, ref: c })), npcDeck(npcSuits[0]), partner ? npcDeck(partner) : companion ? mercCards(companion.deck) : null, npcDeck(npcSuits[1])],
     names: names || ["You", `Rival A (${npcSuits[0]})`, partner ? `Partner (${partner})` : companion ? companion.name : "Companion", `Rival B (${npcSuits[1]})`] });
 }
 
@@ -580,7 +652,7 @@ export function checkpointMatch({ rng, cargo, playerPersonal, value, trickLimit,
   const km = () => ZSIR_RANKS.map((rank) => npcCard(rank, "King's Men"));
   return newMatch({ rng, value, trickLimit, onPlay, onTrick, kind: "checkpoint", suits: suits && suits.length ? suits : null,   // D-379, D-399
     encounterDeck: cargo.map((c) => card(c.rank, c.suit, { ...c, ref: c })),
-    personal: [playerPersonal.map((c) => card(c.rank, c.suit, { ...c, ref: c })), km(), companion ? mercCards(companion.deck) : null, km()],
+    personal: [drawable(playerPersonal).map((c) => card(c.rank, c.suit, { ...c, ref: c })), km(), companion ? mercCards(companion.deck) : null, km()],
     names: ["You", "King's Man A", companion ? companion.name : "Companion", "King's Man B"] });
 }
 
@@ -603,12 +675,12 @@ export function checkpointOutcome(m) {
 /** deck: the exposed cargo of both sides plus top-up cards, each tagged own: "player" | "opp" | "gen" and ref to the original.
  *  The ambusher (seats 1 and 3) leads, random between its two participants (D-176, D-213). The opponents bring full-rank
  *  personal decks of their faction (D-450; Region 1 unupgraded). Personal cards are transient (D-185). */
-export function ambushMatch({ rng, deck, playerPersonal, faction, value, trickLimit, onPlay, onTrick, names, leaderSide = 1, wanted, opponentPersonal, companion }) {
+export function ambushMatch({ rng, deck, playerPersonal, faction, value, trickLimit, onPlay, onTrick, names, leaderSide = 1, wanted, opponentPersonal, companion, learnSuit, opponentCompanion }) {
   const fd = () => ZSIR_RANKS.map((rank) => npcCard(rank, faction));
-  const m = newMatch({ rng, value, trickLimit, onPlay, onTrick, wanted, kind: "ambush", twoTricksOnSixteen: true,
+  const m = newMatch({ rng, value, trickLimit, onPlay, onTrick, wanted, kind: "ambush", twoTricksOnSixteen: true, learnSuit: learnSuit || faction,
     leader: (rng.next() < 0.5 ? 0 : 2) + leaderSide,
     encounterDeck: deck,
-    personal: [playerPersonal.map((c) => card(c.rank, c.suit, { ...c, ref: c })), opponentPersonal ? opponentPersonal.map((c) => card(c.rank, c.suit, { ...c, ref: c })) : fd(), companion ? mercCards(companion.deck) : null, opponentPersonal ? null : fd()],
+    personal: [drawable(playerPersonal).map((c) => card(c.rank, c.suit, { ...c, ref: c })), opponentPersonal ? drawable(opponentPersonal).map((c) => card(c.rank, c.suit, { ...c, ref: c })) : fd(), companion ? mercCards(companion.deck) : null, opponentCompanion ? mercCards(opponentCompanion.deck) : opponentPersonal ? null : fd()],   // a rival's own mercenary plays seat 3 (D-1188; D-1231)
     names: names || ["You", `${faction} A`, companion ? companion.name : "Companion", `${faction} B`] });
   if (companion && names) m.names[2] = companion.name;
   return m;
@@ -620,13 +692,14 @@ const mercCards = (deck) => deck.map((c) => card(c.rank, c.suit, { ...c, mercDec
 export const CONFRONTATION = { VII: 7, VIII: 1, IX: 2, X: 3, "Alsó": 4, "Felső": 5, "Király": 6, "Ász": 8 };
 /** a duel between two caravans (D-186, D-283): personal cards only, each side's personal deck in place of the encounter deck
  *  (four-card hands, the personal slots empty), every card transient; at most two completed tricks; first lead random */
-export function duelMatch({ rng, playerPersonal, opponentPersonal, names, onPlay, onTrick, value, companion }) {
-  const mix = (a) => shuffle(rng, a.map((c) => card(c.rank, c.suit, { ...c, ref: c, origin: "pers" })));
+export function duelMatch({ rng, playerPersonal, opponentPersonal, names, onPlay, onTrick, value, companion, learnSuit, opponentCompanion }) {
+  const mix = (a) => shuffle(rng, drawable(a).map((c) => card(c.rank, c.suit, { ...c, ref: c, origin: "pers" })));
   const mine = mix(playerPersonal), theirs = mix(opponentPersonal), merc = companion ? mix(companion.deck) : null;
-  const hands = [mine.splice(-4), theirs.splice(-4), (merc || mine).splice(-4), theirs.splice(-4)];
-  const m = newMatch({ rng, value, trickLimit: 2, onPlay, onTrick, kind: "duel", encounterDeck: [], personal: [[], [], null, []], hands, names });
+  const merc2 = opponentCompanion ? mix(opponentCompanion.deck) : null;   // the other side's deployed mercenary plays seat 3 (D-186, D-1188; D-1231)
+  const hands = [mine.splice(-4), theirs.splice(-4), (merc || mine).splice(-4), (merc2 || theirs).splice(-4)];
+  const m = newMatch({ rng, value, trickLimit: 2, onPlay, onTrick, kind: "duel", encounterDeck: [], personal: [[], [], null, []], hands, names, learnSuit });
   m.hands = m.hands.map((h, s) => h.map((c) => ({ ...c, origin: "pers", ownerSeat: s })));   // personal and transient (D-186)
-  m.personal = [mine, theirs, merc, theirs];               // replenishment from each side's own deck (seat 3 shares seat 1's; a mercenary its own)
+  m.personal = [mine, theirs, merc, merc2 || theirs];               // replenishment from each side's own deck (seat 3 shares seat 1's; a mercenary its own)
   m.finalTrick = false;
   return m;
 }
@@ -653,16 +726,17 @@ export function ambushOutcome(m) {
 /** Four requests between partners: requests, not orders; the receiver may follow or ignore. Free to give at any time
  *  during play; one standing request, replaced by the next, cleared at the end of the trick. */
 export const COMMANDS = { add: "Add lard!", noadd: "Don't add lard!", hold: "Hold!", nohold: "Don't hold!" };
-export function command(m, type) {
+export function command(m, type, seat = 0) {   // either side calls to its own partner (D-409: between partners; D-1232)
   if (m.ended || !COMMANDS[type]) return;
-  m.command = type; say(m, `You call to your partner: ${COMMANDS[type]}`);
+  if (seat % 2 === 0) m.command = type; else m.command1 = type;
+  say(m, `${seat === 0 ? "You call" : `${m.names[seat]} calls`} to ${seat === 0 ? "your" : "their"} partner: ${COMMANDS[type]}`);
 }
 
 // ---------------------------------------------------------------- friendly roadside match (D-795, D-797, D-881)
 /** The player's personal deck replaces the encounter deck, split between player and companion; the opponents a one-faction
  *  deck of the same size; personal slots stay empty (D-283); at most 2 completed tricks (D-881); Zsír points decide. */
 export function friendlyMatch({ rng, playerPersonal, faction, value, names, companion }) {
-  const mine = shuffle(rng, playerPersonal.map((c) => card(c.rank, c.suit, { ...c, ref: c })));
+  const mine = shuffle(rng, drawable(playerPersonal).map((c) => card(c.rank, c.suit, { ...c, ref: c })));
   const theirs = [];
   while (theirs.length < mine.length) theirs.push(...ZSIR_RANKS.map((rank) => npcCard(rank, faction)));   // duplicates if needed (D-797)
   const t2 = shuffle(rng, theirs.slice(0, mine.length)), half = Math.ceil(mine.length / 2), half2 = Math.ceil(t2.length / 2);

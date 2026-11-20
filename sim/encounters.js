@@ -129,7 +129,34 @@ export function rosterChooser(rng, tier, beastsRoster) {
   };
 }
 const inRoster = (s, roster) => (roster === "main" ? s.roster === "main" || s.roster === "alternative" : s.roster === roster);
-export function poiDeckCard(rng, poiType, mine, tier, beastsRoster) {
+// environment weighting of a suit's commodity variants (method B, D-642; placements D-643, D-644; D-1193): odds influences only,
+// never restrictions; a refinement chain follows its base (the base stage is what's chosen); the place's surroundings come from the
+// region file (stop.env: land and water shares within the occupation radius). Strengths are PLACEHOLDERS
+const VARIANT_WEIGHT = {
+  Parchment: (x) => (x.poi === "monastery" ? 2 : 1), Reliquary: (x) => (x.poi === "monastery" ? 2 : 1),          // special sites raise odds
+  "Broken Weapons": (x) => (x.kind === "checkpoint" || x.poi === "military camp" || x.castle ? 2 : 1),          // castles, checkpoints, camps
+  Grapes: (x) => 1 + 2 * (x.env.hills || 0), "Sweet Grapes": (x) => 1 + 2 * (x.env.hills || 0),                // fields, hills raise odds
+  Millet: (x) => ((x.suits || []).includes("Plainsfolk") ? 2 : 1),                                              // more likely than Wheat with Plainsfolk
+  Ore: (x) => 1 + (x.env.hills || 0) + (x.env.mountains || 0), "Copper Ore": (x) => 1 + (x.env.hills || 0) + (x.env.mountains || 0),
+  "Rock Salt": (x) => 1 + (x.env.hills || 0) + (x.env.mountains || 0), "Silver Ore": (x) => 1 + (x.env.hills || 0) + (x.env.mountains || 0),
+  "Gold Ore": (x) => 1 + (x.env.hills || 0) + (x.env.mountains || 0),                                         // hills and mountains
+  Reeds: (x) => ((x.env.marsh || 0) > 0.3 ? 1 : 0.5 + 2 * (x.env.marsh || 0)),                                 // marsh 50/50 kept; elsewhere wetland
+  Loach: (x) => ((x.env.marsh || 0) > 0.3 ? 1 : 0.5 + 2 * ((x.env.river || 0) + (x.env.lake || 0))),          // and shoreline influence
+  Egret: (x) => 1 + 4 * (x.env.marsh || 0), Sterlet: (x) => 1 + (x.env.river || 0) + (x.env.lake || 0),        // Egret strongly marsh
+  "Plains Pig": (x) => 1 + 2 * (x.env.forest || 0),                                                             // pigs near forests
+  "Wild Horse": (x) => (1 + 2 * (x.env.large_flatland || 0)) * (x.kind === "settlement" ? 0.7 : 1.3),          // open flatland, away from settlements
+  "Willow Branches": (x) => 1 + 2 * ((x.env.river || 0) + (x.env.marsh || 0)),                                 // rivers, floodplains, marshes
+  "Beaver Pelt": (x) => 1 + 2 * ((x.env.river || 0) + (x.env.lake || 0) + (x.env.marsh || 0)),                 // rivers, lakes, wetlands
+  "Bone Dice": (x) => (x.kind === "settlement" ? 1.5 : 1), Koboz: (x) => (x.kind === "settlement" ? 1.5 : 1),  // around settlements, any size
+};
+function weightedPick(rng, opts, ctx) {
+  if (!ctx || opts.length < 2) return rng.pick(opts);
+  const w = opts.map((o) => (VARIANT_WEIGHT[o.name] ? VARIANT_WEIGHT[o.name]({ env: {}, ...ctx }) : 1)), tot = w.reduce((a, b) => a + b, 0);
+  let x = rng.next() * tot; for (let i = 0; i < opts.length; i++) { x -= w[i]; if (x < 0) return opts[i]; } return opts[opts.length - 1];
+}
+/** a place's context for the weighting: its surroundings, kind, POI identity and suits */
+export const placeCtx = (stop) => (stop ? { env: stop.env || {}, kind: stop.kind, poi: stop.poi, suits: stop.suits || [], castle: !!stop.castleTown } : null);
+export function poiDeckCard(rng, poiType, mine, tier, beastsRoster, ctx = null) {
   const P = PLACEHOLDER.poiRewards[poiType] || {}, M = PLACEHOLDER.mineLean, rosterOf = rosterChooser(rng, tier, beastsRoster);
   return (rank, suit) => {
     const roster = rosterOf(suit);
@@ -145,7 +172,8 @@ export function poiDeckCard(rng, poiType, mine, tier, beastsRoster) {
       const lean = M[mine]?.[rank];
       if (lean && rng.next() < lean.chance) { const c = pick((s) => s.stage === 0 && lean.names.includes(s.name)); if (c) return c; }
     }
-    return pick((s) => s.stage === 0) || {};                 // D-487: random among the suit's versions of this card
+    { const o = stagesOf((s) => s.suit === suit && s.rank === rank && inRoster(s, "main") && s.stage === 0);   // D-487 versions, weighted by the place (D-642)
+      return o.length ? cardFromStage(weightedPick(rng, o, ctx)) : {}; }
   };
 }
 

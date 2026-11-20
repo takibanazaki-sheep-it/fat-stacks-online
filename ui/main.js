@@ -4,12 +4,12 @@ import { newGame, options, act as simAct, describe, defaultPayment, requirementS
 import { CATALOGUE as ENCOUNTERS } from "../sim/encounters.js";
 import { FARMFOLK_IX, unbuiltAbilities } from "../sim/abilities.js";
 import { RULES, SZARAZ, PLACEHOLDER } from "../sim/rules.js";
-import { mountMatch } from "./match.js";
+import { mountMatch, SUIT } from "./match.js";
 import { START_CIVS } from "../sim/world.js";
 import { loadProfile, saveProfile, awardRun, openHideout, captureBonus } from "./hideout.js";
 import { entry as upgradeEntry } from "../sim/upgrades.js";
-import { newWorld, worldAct, flushAfter, visibleCaravans, inspectCaravan, richest, meetings, aiChallenges, challenge as challengeSolo, answer as answerSolo, payToll as payTollSolo, trade as tradeSolo, ambushCaravan as ambushSolo, finishDuel as finishDuelSolo, stakeValue, nextRegion } from "../sim/world.js";
-import { encodeMove, encodeZ, encodeStake } from "../sim/multi.js";
+import { newWorld, worldAct, flushAfter, visibleCaravans, inspectCaravan, richest, meetings, aiChallenges, challenge as challengeSolo, answer as answerSolo, payToll as payTollSolo, trade as tradeSolo, answerCounter as answerCounterSolo, proposeTrade as proposeTradeSolo, ambushCaravan as ambushSolo, finishDuel as finishDuelSolo, stakeValue, nextRegion } from "../sim/world.js";
+import { encodeMove, encodeZ, encodeStake, humansMet } from "../sim/multi.js";
 import { online, hideNet } from "./net.js";
 import { cutValue } from "../sim/engine.js";
 import { ATTRITION } from "../sim/zsir.js";
@@ -42,6 +42,9 @@ async function waitForRegion(n, label) {
     await new Promise((r) => setTimeout(r, 400));
   }
 }
+// the region's journey length is its checkpoint's stop number (journeys now follow the region, D-1105); the ruled 8 is the fallback
+function journeyStops(board) { const ck = board && board.stops.find((s) => s.id === board.checkpoint); return (ck && ck.stop) || RULES.stopsPerRegion; }
+
 function showGenScreen(text, failed = false) {
   let el = document.getElementById("genScreen");
   if (!el) { el = document.createElement("div"); el.id = "genScreen"; document.body.append(el); }
@@ -57,6 +60,7 @@ const AUTOPLAY = params.get("autoplay") === "1";   // testing: the AI also plays
 
 let board, svg, overlay;
 // a region's board and picture; the run swaps them at each border (D-326)
+let WORLDMAP = null;                                   // declared before the first board loads (its neighbours read it)
 async function loadBoard(name) {
   board = MP ? JSON.parse(MP.net.files[`${name}.json`]) : await (await fetch(`${DATA_DIR}/${name}.json`)).json();
   if (MP) board = MP.net.world().humans[MP.seat].board.region === board.region ? MP.net.world().humans[MP.seat].board : board;   // the world's own copy
@@ -66,7 +70,65 @@ async function loadBoard(name) {
   const { pad, top, cell } = board.map; svg.setAttribute("viewBox", `${pad - 4} ${top - 24} ${board.W * cell + 8} ${board.H * cell + 48}`);   // room for markers at the edges
   svg.removeAttribute("style"); for (const t of [...svg.querySelectorAll(":scope > text")]) { const y = +t.getAttribute("y"); if (y < top || y > top + board.H * cell) t.remove(); }
   overlay = document.createElementNS(NS, "g"); svg.appendChild(overlay);
+  svg.dataset.region = svg.getAttribute("viewBox"); fitPanel(); zoomable(); neighbours();
   return board;
+}
+// D-459: the region keeps its proportions and fits the panel; the panel's spare space shows the neighbouring regions' geography
+// (their parchment, washes and water, no roads or places: visible, not explorable). The view widens to the panel's shape
+function fitPanel() {
+  const [x, y, w, h] = svg.dataset.region.split(" ").map(Number), r = svg.getBoundingClientRect();
+  let box = [x, y, w, h];
+  if (r.width > 50 && r.height > 50 && getComputedStyle(svg).height !== "auto") {
+    const a = r.width / r.height;
+    box = w / h < a ? [x - (h * a - w) / 2, y, h * a, h] : [x, y - (w / a - h) / 2, w, w / a];
+  }
+  svg.dataset.base = box.join(" "); svg.setAttribute("viewBox", box.join(" "));
+}
+async function neighbours() {
+  const W = WORLDMAP, n = board.region; if (!W || !W.regions?.[n] || svg.dataset.nb) return; svg.dataset.nb = "1";
+  const [cx0, cy0, cx1, cy1] = W.regions[n], { pad, top, cell } = board.map, mine = svg;
+  const touch = (a, b) => a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3];
+  const g = document.createElementNS(NS, "g"); g.setAttribute("class", "neighbours"); g.setAttribute("opacity", "0.55"); g.setAttribute("pointer-events", "none");
+  const bg = mine.querySelector(":scope > rect"); (bg ? bg.after(g) : mine.prepend(g));
+  for (const [k, rc] of Object.entries(W.regions)) {
+    if (+k === n || !touch(rc, W.regions[n])) continue;
+    const f = `${WORLD_ID}-r${k}.svg`;
+    let txt = null;
+    try { txt = MP ? MP.net.files[f] : await (await fetch(`${DATA_DIR}/${f}`)).text(); } catch { txt = null; }
+    if (svg !== mine || !txt) continue;                    // the board changed meanwhile, or that region isn't built yet
+    const m = txt.match(/<image\b[^>]*href="(data:image\/png;base64,[^"]+)"[^>]*>/); if (!m) continue;
+    const im = document.createElementNS(NS, "image");
+    for (const [a, v] of Object.entries({ x: pad + (rc[0] - cx0) * cell, y: top + (rc[1] - cy0) * cell, width: (rc[2] - rc[0]) * cell, height: (rc[3] - rc[1]) * cell, preserveAspectRatio: "none" })) im.setAttribute(a, v);
+    im.setAttribute("href", m[1]); g.append(im);
+    const t = document.createElementNS(NS, "text"); const lx = pad + ((rc[0] + rc[2]) / 2 - cx0) * cell, ly = top + ((rc[1] + rc[3]) / 2 - cy0) * cell;
+    for (const [a, v] of Object.entries({ x: lx, y: ly, "text-anchor": "middle", "font-size": 28, fill: "#5b4a33", "font-style": "italic" })) t.setAttribute(a, v);
+    t.textContent = `Region ${k}${W.names?.[k] ? ": " + W.names[k] : ""}`; g.append(t);
+  }
+}
+addEventListener("resize", () => { if (svg && !document.getElementById("board").classList.contains("zoomed")) fitPanel(); });
+// D-459: the whole region fits by default; zoom in (wheel, or the + / − buttons) and pan while zoomed (drag); double-click or
+// "fit" goes back to the whole region. Proportions are never stretched (the viewBox keeps the region's aspect ratio)
+function zoomable() {
+  const box = document.getElementById("board");
+  const view = () => svg.getAttribute("viewBox").split(" ").map(Number), base = () => svg.dataset.base.split(" ").map(Number);
+  const set = (x, y, w, h) => { const [bx, by, bw, bh] = base(); w = Math.min(bw, Math.max(bw / 5, w)); h = w * bh / bw;
+    x = Math.min(bx + bw - w, Math.max(bx, x)); y = Math.min(by + bh - h, Math.max(by, y)); svg.setAttribute("viewBox", `${x} ${y} ${w} ${h}`); box.classList.toggle("zoomed", w < bw - 0.5); };
+  const zoomAt = (f, px = 0.5, py = 0.5) => { const [x, y, w, h] = view(); set(x + px * w * (1 - f), y + py * h * (1 - f), w * f, h * f); };
+  if (box.dataset.zoomable) { box.classList.remove("zoomed"); return; }
+  box.dataset.zoomable = "1";
+  box.addEventListener("wheel", (e) => { if (!svg) return; e.preventDefault(); const r = svg.getBoundingClientRect();
+    zoomAt(e.deltaY < 0 ? 0.8 : 1.25, (e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height); }, { passive: false });
+  let drag = null;
+  box.addEventListener("pointerdown", (e) => { if (!svg || !box.classList.contains("zoomed")) return; drag = { x: e.clientX, y: e.clientY, v: view(), moved: false }; });
+  box.addEventListener("pointermove", (e) => { if (!drag) return; const r = svg.getBoundingClientRect(), [, , w, h] = drag.v, dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
+    if (drag.moved) set(drag.v[0] - dx * w / r.width, drag.v[1] - dy * h / r.height, w, h); });
+  window.addEventListener("pointerup", () => { if (drag?.moved) { const stop = (ev) => { ev.stopPropagation(); ev.preventDefault(); }; window.addEventListener("click", stop, { capture: true, once: true }); setTimeout(() => window.removeEventListener("click", stop, { capture: true }), 0); } drag = null; });
+  box.addEventListener("dblclick", () => { if (svg) set(...base()); });
+  const bar = document.createElement("div"); bar.className = "zoombar";
+  for (const [t, f] of [["+", () => zoomAt(0.7)], ["−", () => zoomAt(1 / 0.7)], ["fit", () => set(...base())]]) {
+    const btn = document.createElement("button"); btn.textContent = t; btn.title = t === "fit" ? "Show the whole region" : t === "+" ? "Zoom in" : "Zoom out"; btn.onclick = (e) => { e.stopPropagation(); if (svg) f(); }; bar.append(btn); }
+  box.parentElement.append(bar);
 }
 // a run address with no world number (a stale or hand-typed one) gets a fresh world; ?region= stays for the fixed test maps
 if (!MP_MODE && params.get("civ") && !WORLD_PARAM && !params.has("region") && !AUTOPLAY) { await startRun(params.get("civ")); await new Promise(() => {}); }
@@ -95,8 +157,7 @@ if (MP_MODE) {
 await loadBoard(MP ? `w${mpWorldNo()}-r1` : REGION);
 function mpWorldNo() { const k = Object.keys(MP.net.files).find((f) => /^w\d+-world\.json$/.test(f)); return k.match(/^w(\d+)/)[1]; }
 const WORLD_ID = MP ? `w${mpWorldNo()}` : REGION.split("-")[0];
-let WORLDMAP = null;
-async function loadWorldMap() { try { WORLDMAP = MP ? JSON.parse(MP.net.files[`${WORLD_ID}-world.json`]) : await (await fetch(`${DATA_DIR}/${WORLD_ID}-world.json?t=${Date.now()}`)).json(); setWorldMap(WORLDMAP); } catch { /* no world layout: no smuggling premium */ } }
+async function loadWorldMap() { try { WORLDMAP = MP ? JSON.parse(MP.net.files[`${WORLD_ID}-world.json`]) : await (await fetch(`${DATA_DIR}/${WORLD_ID}-world.json?t=${Date.now()}`)).json(); setWorldMap(WORLDMAP); if (svg && board) neighbours(); } catch { /* no world layout: no smuggling premium */ } }
 await loadWorldMap();
 // the world overview (D-436): the eight regions, their borders, the major features and the capital, visible from the start;
 // the road so far: regions passed, the current one, the crossings between them (D-452)
@@ -206,14 +267,18 @@ const act = (st, a) => {
 let uiMeet = null;                                     // the stake builder (yours alone, never part of the shared game)
 const curMeet = () => uiMeet ?? world.meet;
 const sendMeet = (e) => MP.net.send({ k: "meet", ...e });
+const sendH = (e) => MP.net.send({ k: "hmeet", ...e });        // meetings between players (D-1188)
+const nm = (st) => (st.ai ? st.ai.name : st.human.name);
 const challenge = (w, ai, yours, theirs) => MP ? sendMeet({ op: "challenge", ai: world.ais.indexOf(ai), yours: encodeStake(state.caravan, yours), theirs: encodeStake(ai.caravan, theirs) }) : challengeSolo(w, ai, yours, theirs);
 const answer = (w, how, counter) => MP ? sendMeet({ op: "answer", how, counter: counter ? { yours: encodeStake(state.caravan, counter.yours), theirs: encodeStake(world.meet.ai.caravan, counter.theirs) } : null }) : answerSolo(w, how, counter);
 const payToll = (w, pay) => MP ? sendMeet({ op: "toll", pay }) : payTollSolo(w, pay);
 const trade = (w, ok) => MP ? sendMeet({ op: "trade", ok }) : tradeSolo(w, ok);
+const proposeTrade = (w, ai, yours, theirs) => MP ? sendMeet({ op: "propose-trade", ai: world.ais.indexOf(ai), yours: encodeStake(state.caravan, yours), theirs: encodeStake(ai.caravan, theirs) }) : proposeTradeSolo(w, ai, yours, theirs);
+const answerCounter = (w, ok) => MP ? sendMeet({ op: "counter-answer", ok }) : answerCounterSolo(w, ok);
 const ambushCaravan = (w, ai) => MP ? sendMeet({ op: "ambush", ai: world.ais.indexOf(ai) }) : ambushSolo(w, ai);
 const finishDuel = (w) => MP ? sendMeet({ op: "finish-duel" }) : finishDuelSolo(w);
 // a match online: your plays go to the host; the AI seats move when the host's accepted moves arrive (sim/multi.js settle)
-const matchRemote = (m) => (MP ? (seat, action) => MP.net.send({ k: "zplay", z: { seat, ...encodeZ(m, seat, action) } }) : null);
+const matchRemote = (m) => (MP ? (seat, action) => MP.net.send(action.type === "command" ? { k: "zcmd", z: { seat, cmd: action.cmd } } : { k: "zplay", z: { seat, ...encodeZ(m, seat, action) } }) : null);
 let mountedHandle = null;
 if (MP) MP.net.onChange((kind, info) => {
   if (kind === "rejected") { (state.log).push({ round: state.round, text: `Not accepted: ${info}`, kind: "warn" }); }
@@ -224,7 +289,7 @@ if (MP) MP.net.onChange((kind, info) => {
 // what you saw of another caravan when you looked (D-396): one look per caravan per round
 const looks = new Map();
 const CIV_COLOUR = { Farmfolk: "#8a5a2b", Clergy: "#a3262a", Forestfolk: "#2f6b3a", Tradesfolk: "#b07d12" };
-function look(ai) { const k = ai.ai.civ + ":" + state.round; if (!looks.has(k)) looks.set(k, inspectCaravan(world, ai)); return looks.get(k); }
+function look(ai) { const k = (ai.ai ? ai.ai.civ : "player " + ai.human.seat) + ":" + state.round; if (!looks.has(k)) looks.set(k, inspectCaravan(world, ai)); return looks.get(k); }
 const payChoice = new Map();          // leg -> per-fee choice, chosen in the panel
 
 function el(tag, attrs = {}, text) {
@@ -234,14 +299,54 @@ function el(tag, attrs = {}, text) {
   return e;
 }
 
+// identity icons (D-827): a settlement's identity, and a POI's, as the suit icon of its people. Ruled: the monastery's apple is the
+// Clergy icon (D-788), mining goes under Hillfolk. Readings (D-1198): farming Farmfolk, water margins Fisherfolk, crossings and
+// river junctions Tradesfolk, forts King's Men, foothills Hillfolk, forest edges Forestfolk; camps King's Men, bandit villages
+// Bandits, caves Beasts; ruins and plain edges have none
+const SUIT_COL = { Farmfolk: "#8a5a2b", Clergy: "#b0302a", Forestfolk: "#3d7a3a", Tradesfolk: "#c9962b", Plainsfolk: "#b89a3e", Townsfolk: "#4f6480",
+  Carnivalfolk: "#7d3f8c", Beasts: "#5c4a3a", Bandits: "#2b2b2b", "King's Men": "#284f9e", Hillfolk: "#707070", Fisherfolk: "#2f7f86" };
+function identitySuit(s) {
+  if (s.kind === "poi") return { "active mine": "Hillfolk", "abandoned mine": "Hillfolk", monastery: "Clergy", "military camp": "King's Men", "bandit-overrun village": "Bandits", cave: "Beasts" }[s.poi] || null;
+  const id = s.identity || ""; if (!id) return null;
+  for (const [re, suit] of [[/^farming/, "Farmfolk"], [/^(mining|salt)/, "Hillfolk"], [/^(lakeshore|riverbank|marsh-margin|marsh-edge)/, "Fisherfolk"], [/^(crossing|river-junction)/, "Tradesfolk"],
+    [/^(pass fort|fortified hill)/, "King's Men"], [/^foothill/, "Hillfolk"], [/^(forest-edge|upland-woodland)/, "Forestfolk"]]) if (re.test(id)) return suit;
+  return null;
+}
+function identityBadge(s) {
+  const suit = identitySuit(s); if (!suit) return null;
+  const [x, y] = px(s.cell), bx = x + 12, by = y - 12, g = el("g", { class: "ident", "pointer-events": "none" });
+  g.append(el("circle", { cx: bx, cy: by, r: 7.5, fill: "#f6efdc", stroke: SUIT_COL[suit], "stroke-width": 1.4 }));
+  if (suit === "Clergy") g.append(el("path", { d: "M0 -3 C -3 -6 -8 -4 -7 1 C -6 6 -2 7 0 5.5 C 2 7 6 6 7 1 C 8 -4 3 -6 0 -3 Z", fill: SUIT_COL.Clergy, transform: `translate(${bx} ${by + 0.5}) scale(0.62)` }));
+  else g.append(el("text", { x: bx, y: by + 3.5, "text-anchor": "middle", "font-size": 9.5, fill: SUIT_COL[suit] }, SUIT[suit]?.mark || "•"));
+  const t = el("title"); t.textContent = `${s.identity || s.poi}: ${suit}`; g.append(t); return g;
+}
 function drawOverlay(opts) {
   overlay.replaceChildren();
+  for (const s of board.stops) if (s.kind === "settlement" || (s.kind === "poi" && state.discovered.has(s.id))) { const b = identityBadge(s); if (b) overlay.append(b); }
+  // every settlement can be clicked for what you know of it (D-146, D-715, D-435): a quiet hit area under the move markers
+  for (const s of board.stops) if (s.kind === "settlement" || (s.kind === "poi" && s.poi === "monastery" && state.discovered.has(s.id))) {
+    const [x, y] = px(s.cell), g = el("circle", { cx: x, cy: y, r: 13, fill: "transparent", style: "cursor:help" });
+    g.append(el("title", {}, `${placeName(s)}: click for what you know`)); g.addEventListener("click", (e) => { e.stopPropagation(); showPlaceCard(s); }); overlay.append(g);
+  }
   // hidden locations before discovery (D-859 (10)): POIs a large ?, encounter points a small ?
+  // hidden resource sites you've discovered (D-704, D-706): shown where they are, never a road destination
+  for (const hs of state.hidden || []) if (state.hiddenFound?.has(String(hs.cell))) {
+    const [x, y] = px(hs.cell), g = el("g", {});
+    g.append(el("circle", { cx: x, cy: y, r: 9, fill: "#efe3c4", stroke: "#6a3d9a", "stroke-width": 1.5, "stroke-dasharray": "3 2" }),
+             el("text", { x, y: y + 4, "text-anchor": "middle", "font-size": 11, fill: "#6a3d9a" }, hs.resource === "cave" ? "◒" : "⚒"));
+    const t = el("title"); t.textContent = `Hidden ${hs.variant === "cave" ? "cave" : (hs.variant || "mine").replace("_", " ")} (discovered; no road leads here)`; g.append(t); overlay.append(g);
+  }
   for (const s of board.stops) {
     if (s.kind === "poi" && !state.discovered.has(s.id)) {
       const [x, y] = px(s.cell);
       overlay.append(el("circle", { cx: x, cy: y, r: 13, fill: "#f6f1e4", stroke: "#5b4a33", "stroke-width": 2 }),
                      el("text", { x, y: y + 6, "text-anchor": "middle", "font-size": 18, "font-weight": "bold", fill: "#5b4a33" }, "?"));
+    }
+    // a glitching place (D-751): its encounter deck holds a glitched Corruption card; a visible glitch on the map
+    if (state.glitch?.has(s.id)) {
+      const [x, y] = px(s.cell), g = el("g", { class: "glitch" });
+      for (const [dx, dy, w, col] of [[-16, -20, 12, "#c2185b"], [-10, -17, 16, "#00838f"], [-14, -14, 9, "#7b1fa2"]]) g.append(el("rect", { x: x + dx, y: y + dy, width: w, height: 2.5, fill: col, opacity: 0.85 }));
+      const t = el("title"); t.textContent = "Something here glitches: its encounter deck holds a Corruption card."; g.append(t); overlay.append(g);
     }
     if (s.kind === "encounter" && !state.visited.has(s.id)) {
       const [x, y] = px(s.cell);
@@ -294,13 +399,26 @@ function placeName(s) {
   return s.name;
 }
 // what the taverns said about a place you haven't found (D-435): every version heard, how often, no truth label
+// what you've heard of the Royal Castle's tastes (D-434, D-435): rumours only, counted, no truth labels; the real tastes show in
+// the Capital Region
+function drawKingRumours() {
+  const card = document.getElementById("worldCard"); if (!card) return;
+  let box = document.getElementById("kingRumours"); if (!box) { box = document.createElement("div"); box.id = "kingRumours"; box.className = "small muted"; card.append(box); }
+  const heard = state.rumours?.king || [];
+  if (state.castle || !heard.length) { box.textContent = state.castle ? "" : "The King's tastes: nothing heard yet (greetings in settlements carry rumours)."; return; }
+  const by = { king: "the King covets", up: "the castle pays well for", down: "the castle pays poorly for" }, n = {};
+  for (const x of heard) { const k = `${by[x.what]} ${x.suit}`; n[k] = (n[k] || 0) + 1; }
+  box.textContent = "The King's tastes, rumoured: " + Object.entries(n).sort((a, b) => b[1] - a[1]).map(([k, v]) => (v > 1 ? `${k} (heard ${v} times)` : k)).join("; ") + ".";
+}
 function rumourOf(s) {
   const r = state.rumours?.[s.id]; if (!r || !r.length) return "";
   const n = {}; for (const x of r) n[x] = (n[x] || 0) + 1;
   return "rumoured: " + Object.entries(n).map(([k, v]) => (v > 1 ? `${k} (heard ${v} times)` : k)).join(" or ");
 }
+// demand as you know it (D-146: ↑ sells high, ↓ sells low; known on entering the region, D-715)
+function demandText(id) { const k = state.known?.[id], d = k?.demand; return d ? `↑ ${d.up}${d.down ? ` · ↓ ${d.down}` : ""}` : ""; }
 function placeInfo(s) {
-  if (s.kind === "settlement") return `${s.tier} · ${(s.services || []).join(", ") || "no services"} · people: ${(s.suits || []).join(", ")}`;
+  if (s.kind === "settlement") return `${s.tier} · ${(s.services || []).join(", ") || "no services"} · people: ${(s.suits || []).join(", ")}${demandText(s.id) ? ` · demand ${demandText(s.id)}` : ""}`;
   if (s.kind === "poi") return state.discovered.has(s.id) ? `${s.poi} · people: ${(s.suits || []).join(", ")}` : rumourOf(s) || "something lies off the road here";
   if (s.kind === "encounter") {
     const built = Object.entries(s.odds || {}).filter(([e]) => ENCOUNTERS[e]?.status.startsWith("built")).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([e]) => e);
@@ -308,6 +426,20 @@ function placeInfo(s) {
   }
   if (s.kind === "checkpoint") { const r = requirementStatus(state); return r.playtest ? r.label : `${r.title}: needs ${r.ask}; you have ${r.have}`; }
   return "";
+}
+// the settlement card (D-146, D-435): what you know: services and demand from entering the region; stock as last seen, with when;
+// rumours as heard, counted, never labelled true or false; never live data from afar
+function showPlaceCard(s) {
+  let box = document.getElementById("placeCard");
+  if (!box) { box = document.createElement("div"); box.id = "placeCard"; box.className = "placecard"; document.getElementById("map").append(box); }
+  const k = state.known?.[s.id] || {}, heard = state.rumours?.market?.[s.id] || [], n = {};
+  for (const x of heard) n[x.said] = (n[x.said] || 0) + 1;
+  box.replaceChildren(h("button", { className: "close", onclick: () => box.remove() }, "×"), h("h3", {}, placeName(s)),
+    h("div", { className: "small" }, `${s.tier || s.poi} · people: ${(s.suits || []).join(", ")}`),
+    h("div", { className: "small" }, `Services: ${(k.services || s.services || []).join(", ") || "none"}`),
+    ...(k.demand ? [h("div", { className: "small" }, `Demand: ${k.demand.up} sells high ↑${k.demand.down ? `, ${k.demand.down} sells low ↓` : ""} (known on entering the region)`)] : []),
+    h("div", { className: "small" }, k.stock ? `For sale when you were here (round ${k.round}): ${k.stock.join(", ") || "nothing"}` : "Stock: not seen yet."),
+    ...(Object.keys(n).length ? [h("div", { className: "small muted" }, `Rumoured for sale: ${Object.entries(n).map(([t, v]) => (v > 1 ? `${t} (heard ${v} times)` : t)).join(", ")}`)] : []));
 }
 const ROADS = { highway: "highway", secondary: "secondary road", local: "local road", water: "waterway" };
 
@@ -346,6 +478,43 @@ const fatalStake = (st) => counted(state.caravan) - (st.cards || []).filter((x) 
 function meetingPanel(A) {
   const mt = curMeet(), who = (ai) => ai.ai.name[0].toUpperCase() + ai.ai.name.slice(1), c = state.caravan;
   const desc = (st) => [...(st.cards || []).map(label), ...(st.coins ? [`${st.coins} coins`] : [])].join(" + ") || "nothing";
+  // meetings between players (D-1188)
+  if (mt.kind === "h-duel") {
+    const layer = document.getElementById("matchLayer"), other = world.humans[mt.me === 0 ? mt.duel.b : mt.duel.a];
+    if (mountedMatch !== mt.m) { mountedMatch = mt.m; layer.hidden = false;
+      mountedHandle = mountMatch(layer, mt.m, { humans: AUTOPLAY ? [] : [mt.me], me: mt.me, pace: AUTOPLAY ? 60 : 450, remote: matchRemote(mt.m), title: `A duel with ${nm(other)}`,
+        subtitle: "personal cards only · at most two tricks · confrontation points decide (VII 7 · VIII 1 · IX 2 · X 3 · Alsó 4 · Felső 5 · Király 6 · Ász 8) · the wager is the only prize",
+        onEnd: () => { layer.hidden = true; layer.innerHTML = ""; mountedMatch = null; newsFrom = state.log.length; sendH({ op: "finish-duel" }); render(); } }); }
+    A.append(h("h2", {}, "Duelling…")); return;
+  }
+  if (mt.kind === "h-table" || mt.kind === "h-ambushed") {   // a seat at another player's table, or defending against one (D-1189)
+    const layer = document.getElementById("matchLayer"), by = world.humans[mt.kind === "h-table" ? mt.host : mt.by];
+    if (mt.m.ended) { A.append(h("h2", {}, "Waiting"), h("p", { className: "muted" }, `${nm(by)} is settling the result.`)); return; }
+    if (mountedMatch !== mt.m) { mountedMatch = mt.m; layer.hidden = false;
+      mountedHandle = mountMatch(layer, mt.m, { humans: AUTOPLAY ? [] : [mt.me], me: mt.me, pace: AUTOPLAY ? 60 : 450, remote: matchRemote(mt.m),
+        title: mt.kind === "h-table" ? `Zsír at ${nm(by)}'s table` : `${nm(by)} ambushes you!`,
+        subtitle: mt.kind === "h-table" ? "each seat keeps the cards it captures (D-914); partners who are both players each get a copy (D-232)" : "the deck is both sides' exposed cargo · cards change hands only when captured · the higher final cargo value wins, ties to the defender",
+        onEnd: () => { layer.hidden = true; layer.innerHTML = ""; mountedMatch = null; render(); } }); }
+    A.append(h("h2", {}, "Playing Zsír…")); return;
+  }
+  if (mt.kind === "h-invite") {
+    A.append(h("h2", {}, `${nm(world.humans[mt.host])} asks you to the table`), h("p", { className: "muted" }, "A Zsír match is starting here. Take a seat and you play your own seat, keeping what it captures (D-914)."),
+      h("button", { className: "primary", onclick: () => sendH({ op: "table-answer", join: true }) }, "Take a seat"), h("button", { onclick: () => sendH({ op: "table-answer", join: false }) }, "No thanks"));
+    return;
+  }
+  if (mt.kind === "h-seated-wait" || mt.kind === "h-ambush-wait") { A.append(h("h2", {}, mt.kind === "h-seated-wait" ? "At the table" : "Under attack"), h("p", { className: "muted" }, mt.kind === "h-seated-wait" ? `Waiting for ${nm(world.humans[mt.host])} to start.` : `${nm(world.humans[mt.by])} is setting up the ambush.`)); return; }
+  if (mt.kind === "h-waiting") { A.append(h("h2", {}, `Waiting for ${nm(world.humans[mt.to])}`), h("p", { className: "muted" }, "They're deciding on your offer.")); return; }
+  if (mt.kind === "h-challenged" || mt.kind === "h-countered") {
+    const from = world.humans[mt.from], pr = mt.proposal, mineSt = mt.kind === "h-challenged" ? pr.theirs : pr.yours, theirSt = mt.kind === "h-challenged" ? pr.yours : pr.theirs;
+    A.append(h("h2", {}, mt.kind === "h-challenged" ? `${nm(from)} challenges you to a duel` : `${nm(from)} makes a counteroffer`),
+      h("div", {}, `They stake ${desc(theirSt)} (${stakeValue(theirSt)}) against your ${desc(mineSt)} (${stakeValue(mineSt)}).`),
+      h("div", { className: "muted small" }, "A duel: your personal deck against theirs, at most two tricks; only the wager changes hands. Between players, a refusal has no consequence of its own."),
+      ...(fatalStake(mineSt) ? [h("div", { className: "warn" }, `Careful: lose this duel and you drop below ${RULES.cargoMinimum} cargo cards: the run ends.`)] : []),
+      h("button", { className: "primary", onclick: () => { newsFrom = state.log.length; sendH(mt.kind === "h-challenged" ? { op: "answer", how: "accept" } : { op: "counter-answer", ok: true }); } }, "Accept"),
+      ...(mt.kind === "h-challenged" ? [h("button", { onclick: () => { builder = { ai: from, to: mt.from, yours: { cards: [], coins: 0 }, theirs: { cards: [], coins: 0 }, mode: "counter" }; uiMeet = { kind: "build", ai: from }; render(); } }, "Counteroffer (one only)")] : []),
+      h("button", { onclick: () => { newsFrom = state.log.length; sendH(mt.kind === "h-challenged" ? { op: "answer", how: "refuse" } : { op: "counter-answer", ok: false }); } }, mt.kind === "h-challenged" ? "Refuse" : "Reject (no duel)"));
+    return;
+  }
   if (mt.kind === "duel" || mt.stage === "duel") {
     const layer = document.getElementById("matchLayer");
     if (mountedMatch !== mt.m) { mountedMatch = mt.m; layer.hidden = false;
@@ -356,14 +525,28 @@ function meetingPanel(A) {
   }
   if (mt.kind === "build") {
     const b = builder, theirsSeen = look(b.ai).cards;
-    A.append(h("h2", {}, b.mode === "counter" ? "Your counteroffer" : `Challenge ${b.ai.ai.name}`),
+    if (b.mode === "trade") {                            // a trade you propose (D-395): 1–4 cards in all, coins allowed, both agree
+      const n = b.yours.cards.length + b.theirs.cards.length, okN = n >= 1 && n <= 4;
+      A.append(h("h2", {}, `Trade with ${nm(b.ai)}`),
+        h("div", { className: "muted small" }, "1 to 4 cards in all, coins may be added on either side; they agree only if it's worth it to them (D-395)."),
+        wagerSide("You give", b.yours, c.cargo, true), wagerSide("You ask for", b.theirs, theirsSeen, true, b.ai),
+        h("div", { className: okN ? "" : "warn" }, `${n} card${n === 1 ? "" : "s"} · you give ${stakeValue(b.yours)}, you get ${stakeValue(b.theirs)}`),
+        h("button", { className: "primary", disabled: !okN || b.yours.coins > c.coins,
+          onclick: () => { newsFrom = state.log.length; const ai = b.ai; uiMeet = null; builder = null;
+            if (b.to != null) sendH({ op: "trade", to: b.to, yours: encodeStake(state.caravan, b.yours), theirs: encodeStake(ai.caravan, b.theirs) }); else proposeTrade(world, ai, b.yours, b.theirs); render(); } }, "Offer the trade"),
+        h("button", { onclick: () => { uiMeet = null; builder = null; render(); } }, "Back"));
+      return;
+    }
+    A.append(h("h2", {}, b.mode === "counter" ? "Your counteroffer" : `Challenge ${nm(b.ai)}`),
       h("div", { className: "muted small" }, "Both stakes must be worth exactly the same (D-224): cargo at its value, coins at face value. Pick from your cargo and from the cards you saw on theirs."),
       wagerSide("You stake", b.yours, c.cargo, true), wagerSide("You ask of them", b.theirs, theirsSeen, true, b.ai),
       h("div", { className: stakeValue(b.yours) === stakeValue(b.theirs) && stakeValue(b.yours) > 0 ? "good" : "warn" }, `${stakeValue(b.yours)} against ${stakeValue(b.theirs)}`),
       ...(fatalStake(b.yours) ? [h("div", { className: "warn" }, `Careful: lose with this stake and you drop below ${RULES.cargoMinimum} cargo cards: the run ends.`)] : []),
       h("button", { className: "primary", disabled: stakeValue(b.yours) !== stakeValue(b.theirs) || stakeValue(b.yours) <= 0,
         onclick: () => { newsFrom = state.log.length; const ai = b.ai, mode = b.mode; uiMeet = null; builder = null;
-          if (mode === "counter") answer(world, "counter", { yours: b.yours, theirs: b.theirs }); else challenge(world, ai, b.yours, b.theirs); render(); } }, b.mode === "counter" ? "Send the counteroffer" : "Send the challenge"),
+          if (b.to != null && mode === "counter") sendH({ op: "answer", how: "counter", counter: { yours: encodeStake(state.caravan, b.yours), theirs: encodeStake(ai.caravan, b.theirs) } });
+          else if (b.to != null) sendH({ op: "challenge", to: b.to, yours: encodeStake(state.caravan, b.yours), theirs: encodeStake(ai.caravan, b.theirs) });
+          else if (mode === "counter") answer(world, "counter", { yours: b.yours, theirs: b.theirs }); else challenge(world, ai, b.yours, b.theirs); render(); } }, b.mode === "counter" ? "Send the counteroffer" : "Send the challenge"),
       h("button", { onclick: () => { uiMeet = null; builder = null; render(); } }, "Back"));
     return;
   }
@@ -371,11 +554,23 @@ function meetingPanel(A) {
     const pr = mt.proposal;
     A.append(h("h2", {}, `${who(mt.ai)} challenges you to a duel`),
       h("div", {}, `They stake ${desc(pr.theirs)} (${stakeValue(pr.theirs)}) against your ${desc(pr.yours)} (${stakeValue(pr.yours)}).`),
-      h("div", { className: "muted small" }, `A duel: your personal deck against theirs, at most two tricks; only the wager changes hands. If you refuse, ${{ Clergy: "the pilgrims let it go", Forestfolk: "the foresters may let it go, or demand a toll and attack if you won't pay", Tradesfolk: "the merchants offer a trade instead" }[mt.ai.ai.civ] || "they decide"} (D-412).`),
+      h("div", { className: "muted small" }, `A duel: your personal deck against theirs, at most two tricks; only the wager changes hands. If you refuse, ${{ Clergy: "they let it go", Townsfolk: "they let it go", Farmfolk: "they let it go", Carnivalfolk: "they let it go", Fisherfolk: "they let it go",
+        Forestfolk: "they may let it go, or demand a toll and attack if you won't pay", Tradesfolk: "they offer a trade instead", Bandits: "they attack",
+        Beasts: "they attack", Plainsfolk: "they may let it go, or attack", Hillfolk: "they attack if this is Hillfolk country, else let it go",
+        "King's Men": "they may report you (more suspicion), let it go, or inspect your cargo" }[mt.ai.ai.civ] || "they decide"} (D-412).`),
       ...(fatalStake(pr.yours) ? [h("div", { className: "warn" }, `Careful: you have ${counted(c)} cargo cards. Lose this duel and you drop below ${RULES.cargoMinimum}: the run ends.`)] : []),
       h("button", { className: `primary${fatalStake(pr.yours) ? " risk" : ""}`, onclick: () => { if (fatalStake(pr.yours) && !confirm(`Losing this duel ends the run (below ${RULES.cargoMinimum} cargo cards). Accept anyway?`)) return; newsFrom = state.log.length; answer(world, "accept"); render(); } }, "Accept"),
       h("button", { onclick: () => { builder = { ai: mt.ai, yours: { cards: [], coins: 0 }, theirs: { cards: [], coins: 0 }, mode: "counter", prev: mt }; uiMeet = { kind: "build", ai: mt.ai }; render(); } }, "Counteroffer (one only)"),
       h("button", { onclick: () => { newsFrom = state.log.length; answer(world, "refuse"); render(); } }, "Refuse"));
+    return;
+  }
+  if (mt.kind === "countered") {                         // the AI's one counteroffer to your challenge (D-204 (2), D-1175)
+    const pr = mt.proposal;
+    A.append(h("h2", {}, `${who(mt.ai)} counters your challenge`),
+      h("div", {}, `They stake ${desc(pr.theirs)} (${stakeValue(pr.theirs)}) against your ${desc(pr.yours)} (${stakeValue(pr.yours)}).`),
+      ...(fatalStake(pr.yours) ? [h("div", { className: "warn" }, `Careful: lose this duel and you drop below ${RULES.cargoMinimum} cargo cards: the run ends.`)] : []),
+      h("button", { className: "primary", onclick: () => { newsFrom = state.log.length; answerCounter(world, true); render(); } }, "Accept the counteroffer"),
+      h("button", { onclick: () => { newsFrom = state.log.length; answerCounter(world, false); render(); } }, "Reject (no duel)"));
     return;
   }
   if (mt.kind === "toll") {
@@ -402,7 +597,7 @@ function render() {
   { const goal = requirementStatus(state), sus = suspicion(state);
     const chip = (k, v, cls = "", title = "") => h("span", { className: `stat ${cls}`, title }, h("small", {}, k), h("b", {}, v));
     document.getElementById("statusbar").replaceChildren(
-      chip("Stop", `${here.stop} / ${RULES.stopsPerRegion}`),
+      chip("Stop", `${here.stop} / ${journeyStops(board)}`),
       chip("Coins", String(c.coins)),
       chip("Wagon", `${slots(c)} / ${c.capacity}`, counted(c) <= RULES.cargoMinimum ? "warnc" : "", `At least ${RULES.cargoMinimum} cargo cards or the run ends${c.cargo.some((x) => x.roster === "agricultural roster" && x.suit === "Beasts" && x.rank === "VII") ? " (Locust Swarms don't count)" : ""}`),
       chip(goal.playtest ? "Goal" : goal.title, goal.playtest ? `${goal.have} / ${goal.count}` : `${goal.short} ${goal.have} / ${goal.count}`, goal.met ? "okc" : "", goal.playtest ? goal.label : `Checkpoint: ${goal.title}: ${goal.ask}, across cargo and personal deck`),
@@ -460,6 +655,8 @@ function render() {
   } else if (opts.phase === "loot") {
     A.append(h("h2", {}, `What's left of ${opts.rival}`), h("div", { className: "muted" }, "Take what fits; the rest is abandoned (D-230)."),
       h("div", { className: "chips" }, ...opts.actions.filter((a) => a.type === "take").map((a) => h("button", { className: "chip", style: "width:auto", disabled: !a.allowed, onclick: () => { act(state, { type: "take", i: a.i }); render(); } }, label(a.card)))),
+      h("div", { className: "muted" }, "Make room: leave one of your own cards on the pile (D-230)."),
+      h("div", { className: "chips" }, ...opts.actions.filter((a) => a.type === "leave-own").map((a) => h("button", { className: "chip", style: "width:auto", disabled: !a.allowed, onclick: () => { act(state, { type: "leave-own", i: a.i }); render(); } }, label(a.card)))),
       h("button", { className: "primary", onclick: () => { act(state, { type: "done-loot" }); render(); } }, "Done"));
   } else if (opts.phase === "declare" && (curMeet() || (!MP && aiChallenges(world)))) {
     meetingPanel(A);
@@ -477,12 +674,23 @@ function render() {
     // Nose for Wealth: the richest cargo in the region, yours included, with no value shown (D-717)
     if (c.personal.some((x) => x.suit === "Townsfolk" && x.rank === "X" && x.adjective === "Heady" && (!x.roster || x.roster === "main"))) {
       const rich = richest(world); A.append(h("div", { className: "small muted" }, `Nose for Wealth: ${rich === state ? "your own cargo is the richest in the region" : `${rich.ai.name} carries the richest cargo`}.`)); }
+    if (MP && state.hOffer) { const o = state.hOffer, from = world.humans[o.from], d = (st) => [...st.cards.map(label), ...(st.coins ? [`${st.coins} coins`] : [])].join(" + ") || "nothing";
+      A.append(h("div", { className: "news" }, h("b", {}, `${nm(from)} offers a trade: `), `you get ${d(o.yours)} for your ${d(o.theirs)}. `,
+        h("button", { onclick: () => { newsFrom = state.log.length; sendH({ op: "trade-answer", ok: true }); } }, "Accept"), " ",
+        h("button", { onclick: () => { newsFrom = state.log.length; sendH({ op: "trade-answer", ok: false }); } }, "Decline"))); }
+    const hmet = MP ? humansMet(world, MP.seat) : [];
+    if (hmet.length) A.append(h("div", { className: "news" }, h("div", { className: "muted" }, "Another player is here (D-730)"),
+      ...hmet.map(({ h: st, k }) => h("div", {}, h("b", {}, nm(st)), ` (${st.human.civ}) `,
+        h("button", { onclick: () => { builder = { ai: st, to: k, yours: { cards: [], coins: 0 }, theirs: { cards: [], coins: 0 }, mode: "challenge" }; uiMeet = { kind: "build", ai: st }; render(); } }, "Challenge to a duel"), " ",
+        h("button", { onclick: () => { builder = { ai: st, to: k, yours: { cards: [], coins: 0 }, theirs: { cards: [], coins: 0 }, mode: "trade" }; uiMeet = { kind: "build", ai: st }; render(); } }, "Propose a trade"), " ",
+        h("button", { onclick: () => { if (confirm(`Ambush ${nm(st)}? The ordinary ambush rules: exposure by military, your side leads.`)) sendH({ op: "ambush", to: k }); } }, "Ambush")))));
     const met = meetings(world);
     if (met.length) A.append(h("div", { className: "news" }, h("div", { className: "muted" }, "Another caravan is here (D-730)"),
       ...met.map((ai) => h("div", {}, h("b", {}, ai.ai.name[0].toUpperCase() + ai.ai.name.slice(1)), " ",
         h("button", { onclick: () => { builder = { ai, yours: { cards: [], coins: 0 }, theirs: { cards: [], coins: 0 }, mode: "challenge" }; uiMeet = { kind: "build", ai }; render(); } }, "Challenge to a duel"), " ",
+        h("button", { onclick: () => { builder = { ai, yours: { cards: [], coins: 0 }, theirs: { cards: [], coins: 0 }, mode: "trade" }; uiMeet = { kind: "build", ai }; render(); } }, "Propose a trade"), " ",
         h("button", { onclick: () => { if (confirm("Ambush them? The ordinary ambush rules: exposure by military, your side leads.")) { ambushCaravan(world, ai); render(); } } }, "Ambush")))));
-    A.append(h("h2", {}, c.emergency ? "Return to the checkpoint" : `Where next? (stop ${here.stop + 1} of ${RULES.stopsPerRegion})`),
+    A.append(h("h2", {}, c.emergency ? "Return to the checkpoint" : `Where next? (stop ${here.stop + 1} of ${journeyStops(state.board)})`),
       h("div", { className: "muted small" }, "Click a card, a numbered marker on the map, or press its number key."));
     opts.moves.forEach((m, k) => {
       const pay = payChoice.get(m.leg) || defaultPayment(state, m.fees); payChoice.set(m.leg, pay);
@@ -615,10 +823,25 @@ function render() {
       h("button", { className: "chip", style: "width:auto", onclick: () => { act(state, { type: "sell-excess", i: x.i }); render(); } }, `${label(x.card)}${x.bundle > 1 ? ` (bundle of ${x.bundle})` : ""} → ${x.price}`))));
     A.append(h("div", { className: "muted" }, "Leave behind (no coins):"), h("div", { className: "chips" }, opts.actions.filter((x) => x.type === "discard").map((x) =>
       h("button", { className: "chip", style: "width:auto", onclick: () => { act(state, { type: "discard", i: x.i }); render(); } }, `${label(x.card)}${x.bundle > 1 ? ` (bundle of ${x.bundle})` : ""}`))));
+  } else if (opts.phase === "cp-event") {                  // other encounters at the checkpoint (D-407 (2))
+    const ev = opts.event;
+    A.append(h("h2", {}, ev.kind === "carnival" ? "A travelling Carnival at the barrier" : "A game at the checkpoint"),
+      h("div", { className: "muted" }, ev.kind === "carnival"
+        ? "Optional. You and your companion against the Carnival's juggler and a guard. Win, and the guards let you through without an inspection (requirements still apply). Lose, and the inspection stands as usual."
+        : `Optional. An ordinary match with the checkpoint's people (${ev.suits.join(", ")}); captures go to your cargo.`),
+      h("button", { className: "primary", onclick: () => { act(state, { type: "cp-play" }); render(); } }, "Play"),
+      h("button", { onclick: () => { act(state, { type: "cp-skip" }); render(); } }, "Go to the barrier"));
+  } else if (opts.phase === "table-wait") {
+    A.append(h("h2", {}, "Waiting for the table"), h("p", { className: "muted" }, `Asking the other players here whether they take a seat (${opts.waitingFor.map((k) => nm(world.humans[k])).join(", ")}).`));
+  } else if (opts.phase === "excursion-offer") {             // a hidden resource site's excursion (D-704 to D-706)
+    A.append(h("h2", {}, `"There's ${/^[aeiou]/.test(opts.site.poi) ? "an" : "a"} ${opts.site.poi} in the hills nearby"`),
+      h("div", { className: "muted" }, `Go and look, and this visit's encounter is there: the site's Zsír match (${opts.site.suits.join(", ")}), with a partner, then back to ${here.name}'s services. Stay, and you lose this visit's settlement actions.`),
+      h("button", { className: "primary", onclick: () => { act(state, { type: "excursion", go: true }); render(); } }, "Go and take a look"),
+      h("button", { onclick: () => { act(state, { type: "excursion", go: false }); render(); } }, "Stay"));
   } else if (opts.phase === "match-offer") {
-    A.append(h("h2", {}, "A Zsír match is on offer"), h("div", { className: "muted" }, here.kind === "poi"
-      ? `Optional. Three locals are here (${here.suits.slice(0, 4).join(", ")}); you'll strike a deal with one of them as your partner. As a ${here.poi}, its deck holds richer goods than a settlement's. Every card your team captures goes into your cargo.`
-      : `Optional. You and your companion against two locals, with the locals' deck of ${here.suits.slice(0, 4).join(", ")}. Every encounter card your team captures goes into your cargo.`
+    A.append(h("h2", {}, "A Zsír match is on offer"), h("div", { className: "muted" }, opts.here.kind === "poi"
+      ? `Optional. Three locals are here (${opts.suits.join(", ")}); you'll strike a deal with one of them as your partner.${opts.here.poi ? ` As a ${opts.here.poi}, its deck holds richer goods than a settlement's.` : ""} Every card your team captures goes into your cargo.`
+      : `Optional. You and your companion against two locals, with the locals' deck of ${opts.suits.join(", ")}. Every encounter card your team captures goes into your cargo.`
         + (visibleCaravans(world).some((v) => v.at === here.id) ? " Other caravans here may take seats; if they do, each seat keeps only the cards it captures itself (D-914)." : "")),
       h("button", { className: "primary", onclick: () => { act(state, { type: "accept" }); render(); } }, "Play the match"),
       h("button", { onclick: () => { act(state, { type: "decline" }); render(); } }, "Decline"));
@@ -661,6 +884,9 @@ function render() {
         onclick: () => { act(state, { type: "fence-bin" }); render(); } }, `Blind bin (${bin.size} cards, unseen) · ${bin.price}c`)));
       const fb = opts.actions.filter((x) => x.type === "fence-buy"), fs = opts.actions.filter((x) => x.type === "fence-sell");
       if (fb.length) F.append(h("div", { className: "muted" }, "Under the counter"), h("div", { className: "chips" }, fb.map((x) => h("button", { className: "chip", style: "width:auto", disabled: !x.allowed, onclick: () => { act(state, { type: "fence-buy", i: x.i }); render(); } }, `${label(x.card)} · ${x.price}c`))));
+      const cs = opts.actions.filter((x) => x.type === "corr-sell");
+      if (cs.length) F.append(h("div", { className: "muted" }, "Corruption cards from your personal deck"), h("div", { className: "chips" }, cs.map((x) => h("button", { className: "chip", style: "width:auto", title: x.card.note || "",
+        onclick: () => { act(state, { type: "corr-sell", i: x.i }); render(); } }, `${label(x.card)} → ${x.card.corr === "receipt" ? "5 commodities" : x.card.corr === "lottery" ? "try your luck" : x.price}`))));
       if (fs.length) F.append(h("div", { className: "muted" }, "Sell your illicit goods"), h("div", { className: "chips" }, fs.map((x) => h("button", { className: `chip${x.endsRun ? " risk" : ""}`, style: "width:auto",
         onclick: () => { if (x.endsRun && !confirm(`This drops your cargo below ${RULES.cargoMinimum} cards: the run will END. Sell anyway?`)) return; act(state, { type: "fence-sell", i: x.i }); render(); } }, `${label(x.card)} → ${x.price}`)))); }
     const m = opts.market;
@@ -701,24 +927,39 @@ function render() {
         }
       }
     }
+    const wg = opts.actions.find((x) => x.type === "wagon-slots");   // wagon capacity at the Magistrates (D-394, D-553)
+    if (wg) { const S = section("wagon", "Magistrates: the wagon");
+      S.append(h("div", { className: "muted small" }, `A licence for ${wg.slots} more cargo slots, for good (capacity ${state.caravan.capacity} → ${state.caravan.capacity + wg.slots}). Test price.`),
+        h("button", { disabled: !wg.allowed, onclick: () => { act(state, { type: "wagon-slots" }); render(); } }, `Extend the wagon · ${wg.price}c`)); }
     if (opts.church) {
       const bl = opts.actions.filter((x) => x.type === "attrition");
       const A = section("Church", "Church");
       A.append(h("div", { className: "muted small" }, `Attrition blessing: ${bl[0]?.price ?? "?"} coins per card (test price). A blessed card can be played sideways in a match for its rank's effect, instead of normally. Hover a card for its effect.`),
         h("div", { className: "chips" }, bl.map((x) => h("button", { className: "chip", style: "width:auto", disabled: !x.allowed, title: `${x.card.rank}: ${ATTRITION[x.card.rank]}`,
           onclick: () => { act(state, { type: "attrition", deck: x.deck, i: x.i }); render(); } }, `${label(x.card)}${x.deck === "personal" ? " (personal)" : ""}`))));
+      const idf = opts.actions.filter((x) => x.type === "identify");
+      if (idf.length) A.append(h("div", { className: "muted small" }, "Identification of glitched cards (D-751): dearer after each one this run. What it turns into is random."),
+        h("div", { className: "chips" }, idf.map((x) => h("button", { className: "chip", style: "width:auto", disabled: !x.allowed,
+          onclick: () => { act(state, { type: "identify", i: x.i, library: !!x.library }); render(); } }, x.library ? "Identify a glitched card with your Library Card · free" : `Identify a glitched card · ${x.price}c`))));
     }
     for (const k of ORDER) if (secs[k]) outer.append(secs[k]);
     for (const [k, d] of Object.entries(secs)) if (!ORDER.includes(k)) outer.append(d);
+  } else if (opts.phase === "shortfall") {        // requirement bribery at evaluation (D-107, D-108; D-1242)
+    const r = opts.requirement, rb = opts.actions.find((a) => a?.type === "req-bribe");
+    A.append(h("h2", {}, "Short of the Requirement"), h("p", {}, `${r.title}: the guards wanted ${r.ask}. You have ${r.have}.`),
+      h("button", { className: "primary", disabled: !rb?.allowed, onclick: () => { act(state, { type: "req-bribe" }); render(); } }, `Pay ${rb?.price} coins to cover the ${rb?.missing} missing card${rb?.missing === 1 ? "" : "s"}`),
+      h("button", { className: "risk", onclick: () => { if (confirm("Refuse the bribe? The run ends.")) { act(state, { type: "accept-shortfall" }); render(); } } }, "Refuse: the run ends"));
   } else if (opts.phase === "checkpoint") {
     const r = opts.requirement;
     A.append(h("h2", {}, "The Checkpoint"), h("p", {}, r.playtest ? `${r.label}. You have ${r.have}${r.suits.length ? ` (${r.suits.join(", ")})` : ""}.` : `${r.title}: the guards want ${r.ask}. You have ${r.have}.`),
       h("div", { className: "muted" }, "You can't wait here: trade, then submit, or take the emergency return."),
       (() => { const sus = suspicion(state); return h("p", { className: sus.inspection ? "warn" : "muted" }, `Suspicion ${sus.total}: ${sus.inspection ? `a scheduled inspection of ${sus.inspection} cards awaits` : "no scheduled inspection, though a guard may still ask for a bribe"}.`); })(),
-      ...opts.actions.filter((a) => a.type === "bribery").map((a) => h("button", { disabled: !a.allowed, onclick: () => { act(state, { type: "bribery", i: a.i, deck: a.deck }); render(); } },
-        `Bribery: ${label(a.card)} buys ${Math.round(a.pct * 100)}% concealment · ${a.price} coins`)),
-      ...opts.actions.filter((a) => a.type === "req-bribe").map((a) => a.price === undefined ? h("div", { className: "muted" }, `Requirement bribe not possible: ${a.why}.`)
-        : h("button", { disabled: !a.allowed, onclick: () => { act(state, { type: "req-bribe" }); render(); } }, `Bribe away the ${a.missing} missing card${a.missing === 1 ? "" : "s"} · ${a.price} coins`)));
+      ...opts.actions.filter((a) => a.type === "bribery").flatMap((a) => [h("button", { disabled: !a.allowed, onclick: () => { act(state, { type: "bribery", i: a.i, deck: a.deck }); render(); } },
+        `Bribery: ${label(a.card)} buys ${Math.round(a.pct * 100)}% concealment · ${a.price} coins`),
+        h("button", { disabled: !a.allowed, onclick: () => { act(state, { type: "bribery", i: a.i, deck: a.deck, alloc: "military" }); render(); } },
+        `Bribery: ${label(a.card)} buys ${a.military} military · ${a.price} coins`)]),
+      ...opts.actions.filter((a) => a.type === "req-bribe-preview").map((a) => h("div", { className: "muted" }, a.price === undefined ? `Requirement bribe not possible: ${a.why}.`
+        : `If you come up short when you submit, the guards can be paid to look past the ${a.missing} missing card${a.missing === 1 ? "" : "s"}: ${a.price} coins (D-107).`)));
     // submitting comes last: trade, bribe or take the emergency return first (the order you'd use them in)
     const submitBtn = h("button", { className: `primary${r.met ? "" : " risk"}`, style: "margin-top:10px", onclick: () => { if (confirm(r.met ? "Submit to the checkpoint?" : "Requirements are NOT met: submitting ends the run. Submit anyway?")) { act(state, { type: "submit" }); render(); } } },
       r.met ? "Submit to the inspection (irreversible)" : r.expedited ? `Submit: requirements NOT met (${r.have} of ${r.count}); Expedited Inspection gives a ${Math.round(PLACEHOLDER.expeditedChance * 100)}% chance, otherwise the run ends` : `Submit anyway: requirements NOT met (${r.have} of ${r.count}), the run ends`);
@@ -769,7 +1010,7 @@ function render() {
   const L = document.getElementById("log");
   L.replaceChildren(...state.log.slice().reverse().map((e) => h("li", { className: e.kind }, `R${e.round}: ${e.text}`)));
   drawOverlay(opts);
-  drawWorld();
+  drawWorld(); drawKingRumours();
   growlToasts();
   if (!REFS) for (const id of ["here", "actions", "caravan", "log", "growls"]) stripRefs(document.getElementById(id));
   if (lastAt !== c.at) { lastAt = c.at; const [x, y] = px(here.cell), m = document.getElementById("map"), r = svg.getBoundingClientRect(), sc = r.width / (board.W * board.map.cell + 8);

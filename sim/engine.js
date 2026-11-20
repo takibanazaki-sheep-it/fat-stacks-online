@@ -19,6 +19,13 @@ export function rollBonus(c) {
   return Math.min(gf + lard + dice, dice ? 10 : 60) / 100;
 }
 const luck = (state, p) => p + rollBonus(state.caravan);
+// the second inspection draw's random size (D-137) with Good Fortune toward the favourable result only (D-381; D-1176, reading:
+// the bonus is the chance the size drops one step, never a larger draw)
+function secondSize(state) {
+  const S = PLACEHOLDER.secondInspectionSizes, k = Math.floor(state.rng.next() * S.length), b = rollBonus(state.caravan);
+  if (k > 0 && b > 0 && state.rng.next() < b) { note(state, `Good Fortune: the second draw is ${S[k - 1]} cards instead of ${S[k]}.`, "good"); return S[k - 1]; }
+  return S[k];
+}
 // Salt Cure (Preserving Rock Salt line in cargo, any stage): automated travel-triggered abilities (arrival included) that refine, swap or
 // transform commodities don't act (D-581, D-654)
 const salted = (state) => state.caravan.cargo.some(HILL.preserving);
@@ -26,7 +33,12 @@ const salted = (state) => state.caravan.cargo.some(HILL.preserving);
 const temper = (state) => Math.max(0, ...state.caravan.cargo.filter(HILL.tempering).map((x) => (x.refined >= 2 ? 0.1 : 0.05)));
 // Solitude (Ascetic Recluse line, personal deck; the best one): services and bribes 10 / 15 / 20 % cheaper while yours is the only
 // caravan there, always so in this build (D-652)
-const solitude = (c) => Math.max(0, ...c.personal.filter(HILL.ascetic).map((x) => [0.1, 0.15, 0.2][x.refined || 0]));
+// ... only while yours is the only caravan at the location (hillfolk.md); the caravan whose action it is (D-1202)
+let traderState = null;
+const aloneHere = () => { const w = traderState?.world; if (!w) return true; const me = traderState;
+  return ![...(w.ais || []), ...(w.humans || []), w.player].some((x) => x && x !== me && !x.ended && x.caravan?.at === me.caravan.at); };
+const best2 = (xs) => xs.sort((a, b) => b - a).slice(0, 2).reduce((a, b) => a + b, 0);   // passives stack at most twice (D-352)
+const solitude = (c) => (c.personal.some(HILL.ascetic) && aloneHere() ? best2(c.personal.filter(HILL.ascetic).map((x) => [0.1, 0.15, 0.2][x.refined || 0])) : 0);
 const isTownOrCity = (here) => here.tier === "town" || here.tier === "city";
 // D-352: passive abilities stack at most twice unless the card says otherwise; D-260: settlement abilities at most twice
 const two = (xs) => xs.slice(0, 2);
@@ -38,9 +50,10 @@ const COMMODITY_NEXT = (x) => { const line = E.lineOf(x); if (!line) return null
   return n ? n.name : null; };
 import * as N from "./negotiation.js";
 import { drawScenario } from "./checkpoint-scenarios.js";
-import { capacity, onPlay, onTrick, highwayExempt as clergyExempt, FARMFOLK, CLERGY, TRADES, PLAINS, TOWNS, CARNIVAL, BANDITS, BEASTS, KINGS, ALT, RURAL, RURAL_T, AGRI, FOREST, HILL, FISH, conscript, FARMFOLK_IX, CLERGY_IX } from "./abilities.js";
+import { capacity, onPlay, onTrick, highwayExempt as clergyExempt, FARMFOLK, CLERGY, ALT_CLERGY, TRADES, PLAINS, TOWNS, CARNIVAL, BANDITS, BEASTS, KINGS, ALT, RURAL, RURAL_T, AGRI, FOREST, HILL, FISH, conscript, FARMFOLK_IX, CLERGY_IX } from "./abilities.js";
 import { offers, apply as applyUpgrade, CHURCH_NOTE, entry as upgradeEntry, upgradedName } from "./upgrades.js";
 import { MERCS, MERC, mercCard, mercDeck, mercOf } from "./mercs.js";
+import { isCorr, isGlitched, glitched, corrCard, identify, identifyPrice, CORRUPTION } from "./corruption.js";
 
 export function newGame(board, seed = 1, mode = "normal", opts = {}) {
   const rng = makeRng(seed);
@@ -60,8 +73,13 @@ export function newGame(board, seed = 1, mode = "normal", opts = {}) {
     run: { earned: 0, spent: 0, tricks: 0, games: 0, regions: [], titles: [] },   // the run's score inputs (D-416, D-748); titles unlocked (D-740)
     captureBonus: opts.captureBonus || 0,                    // the hideout's permanent capture-quality upgrade (D-418)
   };
+  coinLedger(state);
   state.caravan.capacity = capacity(state.caravan);      // Farmer's Papers in the personal deck: 40 (D-714, D-744)
+  // the Royal Castle's tastes are fixed from the run's start, so rumours can be about them; they're shown only in the Capital
+  // Region (D-434; D-1182). Their own random stream, so the run's other rolls are unchanged
+  state.kingTastes = rollTastes(makeRng(seed * 977 + 5));
   setupRegion(state, board, opts);
+  openingPoi(state, opts);
   return state;
 }
 
@@ -71,6 +89,8 @@ export function newGame(board, seed = 1, mode = "normal", opts = {}) {
 // a passenger leaves at the border (D-421). Regions 2-7 start at the entry checkpoint, the previous exit (D-452, D-458), with
 // no second inspection there (D-455); the AI caravans that passed come too (your ruling, 2026-11-05)
 export function enterRegion(state, board, opts = {}) {
+  state.cpOffered = false; state.cpFree = false; state.cpEvent = null;
+  if (state.caravan) state.caravan.reported = 0;                // a King's Men report lasts the region (D-1185)
   const c = state.caravan;
   state.board = board; state.stops = Object.fromEntries(board.stops.map((s) => [s.id, s]));
   state.legsFrom = {}; for (const l of board.legs) (state.legsFrom[l.from] ??= []).push(l);
@@ -107,19 +127,36 @@ function setupRegion(state, board, opts = {}) {
   // Markets: every settlement has one (D-816); stock = commodities of the suits present (D-825 (5)), never Rank X (D-663);
   // demand indicators known on entering the region (D-715); sizes, refresh and demand draws are PLACEHOLDERS (SET-05, SET-11)
   const allSuits = [...new Set([...SUITS, ...board.stops.flatMap((s) => s.suits || [])])];
-  // a monastery works like a Tier I village (D-724, D-725): it gets a village's merchant (D-816); other services not built
-  for (const s of board.stops) if (s.kind === "poi" && s.poi === "monastery" && !(s.services || []).includes("Market")) { s.services = [...(s.services || []), "Market"]; s.tier = s.tier || "village"; }
+  // the suits that actually live in this region: a commodity of any other suit is scarce here (D-417, D-423; D-1241: the starting
+  // suits were always counted, so their goods never were)
+  const livingSuits = [...new Set(board.stops.flatMap((s) => s.suits || []))];
+  // a monastery works like a Tier I village (D-724, D-725): a village's merchant (D-816), and the Church a village gets where Clergy
+  // live (D-817 (2); a monastery's people are Clergy, D-758); D-1194
+  for (const s of board.stops) if (s.kind === "poi" && s.poi === "monastery") { s.services = [...new Set([...(s.services || []), "Market", "Church"])]; s.tier = s.tier || "village"; }
   for (const s of board.stops) if ((s.kind === "settlement" || (s.kind === "poi" && s.poi === "monastery")) && (s.services || []).includes("Market")) {
     const suits = s.suits?.length ? s.suits : SUITS;
     const up = rng.pick(allSuits); let down = rng.pick(allSuits); if (down === up) down = null;
-    const m = { suits, tier: s.tier, beastsRoster: s.beasts_roster, demand: { up, down }, size: PLACEHOLDER.stockSize[s.tier] || 2, stock: [] };
+    const m = { suits, tier: s.tier, beastsRoster: s.beasts_roster, demand: { up, down }, size: PLACEHOLDER.stockSize[s.tier] || 2, stock: [], region: livingSuits };
     while (m.stock.length < m.size) m.stock.push(commodity(rng, m));
     state.markets[s.id] = m;
+  }
+  // what you know of each settlement (D-715, D-146, D-435): its services and demand from the moment you enter the region; its stock
+  // only from a visit (the last one seen, with when) or from rumours; never live data from afar (D-1196)
+  state.known = {};
+  for (const s of board.stops) if (s.kind === "settlement" || (s.kind === "poi" && s.poi === "monastery")) {
+    const mk = state.markets[s.id];
+    state.known[s.id] = { services: [...(s.services || [])], demand: mk ? { ...mk.demand } : null, round: state.round || 1, source: "entry" };
   }
   // Taverns (D-393, D-816 (3)): each offers one of the four mercenaries for hire (which one PLACEHOLDER: at random; rarity is a balance
   // value, MER-03) and sells upgrade packages for the ones you own
   state.taverns = {};
   for (const s of board.stops) if ((s.kind === "settlement" || s.kind === "poi") && (s.services || []).includes("Tavern")) { const tv = { offer: rng.pick(MERCS).id, food: [], suits: s.suits || [] }; while (tv.food.length < PLACEHOLDER.enc.innStock) tv.food.push(tavernFood(rng, tv)); state.taverns[s.id] = tv; }
+  // glitching places (D-751): a settlement or POI whose encounter deck holds a glitched Corruption card, shown on the map; chance
+  // PLACEHOLDER (D-1186)
+  // hidden resource sites (D-704 to D-706): known only to the generator until discovered through their host settlement's event;
+  // discovery is private (D-706 (1)) and lasts the region
+  state.hidden = board.hidden || []; state.hiddenFound = new Set();
+  state.glitch = new Set(board.stops.filter((s) => (s.kind === "settlement" || s.kind === "poi") && !s.castleTown && rng.next() < PLACEHOLDER.corruption.glitchPlace).map((s) => s.id));
   // Fences (D-112, D-812, D-663; settlements.md): a stock of illicit goods, now and then a Rank X; blind bins sold sight unseen
   state.fences = {};
   for (const s of board.stops) if (s.kind === "settlement" && (s.services || []).includes("Fence")) { const f = { stock: [] }; while (f.stock.length < PLACEHOLDER.fence.stock) f.stock.push(fenceGood(rng)); state.fences[s.id] = f; }
@@ -169,7 +206,7 @@ export function feesFor(state, leg) {
       on = true;
     }
     else on = false;
-    if (seg.cls === "water") fees.push({ kind: "water", amount: RULES.waterFare, label: "water fare" });
+    if (seg.cls === "water") fees.push({ kind: "water", amount: discounted(state.caravan, RULES.waterFare), label: "water fare" });   // charged like a crossing (D-860): Special Treatment and the other road-charge cuts apply (D-1209)
     if (seg.cls !== "highway") for (const x of seg.crossings || []) fees.push(state.caravan.personal.some(AGRI.ebborz)   // Tax Evasion: no fee, no cargo surrender (D-499)
       ? { kind: "crossing", amount: 0, label: `${x.type} crossing (waived: Tax Evasion)`, waived: true }
       : { kind: "crossing", amount: discounted(state.caravan, x.fee), label: `${x.type} crossing` });
@@ -196,11 +233,17 @@ export function defaultPayment(state, fees) {
 
 // ---------------------------------------------------------------- what the decision-maker may do now
 export function options(state) {
-  trader = state.caravan;
+  trader = state.caravan; traderState = state;
   const c = state.caravan, here = state.stops[c.at];
   if (state.ended) return { phase: "ended", ended: state.ended };
-  if (state.phase === "match-offer") return { phase: "match-offer", here, actions: [{ type: "accept" }, { type: "decline" }] };
-  if (state.phase === "loot") return { phase: "loot", here, rival: state.loot.rival.ai.name, actions: [...state.loot.cards.map((card, i) => ({ type: "take", i, card, allowed: slots(c) < c.capacity })), { type: "done-loot" }] };
+  if (state.phase === "match-offer") { const at = state.startPoi ? { ...here, ...state.startPoi } : here;   // the opening POI (D-160)
+    return { phase: "match-offer", here: at, suits: state.offerSuits || (at.suits || []).slice(0, 4), actions: [{ type: "accept" }, { type: "decline" }] }; }
+  if (state.phase === "cp-event") return { phase: "cp-event", here, event: state.cpEvent, actions: [{ type: "cp-play" }, { type: "cp-skip" }] };
+  if (state.phase === "table-wait") return { phase: "table-wait", here, waitingFor: state.table?.pending || [], actions: [] };
+  if (state.phase === "excursion-offer") return { phase: "excursion-offer", here, site: state.excursion, actions: [{ type: "excursion", go: true }, { type: "excursion", go: false }] };
+  // looting: take any, and swap out your own cargo: a card of yours left on the pile frees room (D-230; D-1236)
+  if (state.phase === "loot") return { phase: "loot", here, rival: state.loot.rival.ai.name, actions: [...state.loot.cards.map((card, i) => ({ type: "take", i, card, allowed: slots(c) < c.capacity })),
+    ...c.cargo.map((card, i) => ({ type: "leave-own", i, card, allowed: counted(c) > RULES.cargoMinimum })), { type: "done-loot" }] };
   if (state.phase === "recruit") return { phase: "recruit", here, eligible: state.recruit.eligible, personal: c.personal,
     actions: [...state.recruit.eligible.flatMap((card, i) => [{ type: "recruit", i }, ...c.personal.map((_, j) => ({ type: "recruit", i, swap: j }))]), { type: "skip-recruit" }] };
   if (state.phase === "event") return eventOptions(state);
@@ -221,7 +264,7 @@ export function options(state) {
   if (state.phase === "overflow") {
     // D-265 overflow; at a settlement the excess can be sold at its market instead of left behind (D-112, D-874)
     const mk = state.markets[c.at] || null;   // settlements and monasteries (D-874)
-    return { phase: "overflow", here, capacity: c.capacity, excess: slots(c) - c.capacity, market: !!mk,
+    return { phase: "overflow", here, capacity: c.capacity, excess: slots(c) - capLimit(c), market: !!mk,
              actions: c.cargo.flatMap((card, i) => [{ type: "discard", i, card, bundle: mates(c, card).length }, ...(mk ? [{ type: "sell-excess", i, card, bundle: mates(c, card).length, price: priceOf(c, card, (x) => sellPrice(mk, x)) }] : [])]) };
   }
   if (state.phase === "location") {
@@ -254,8 +297,13 @@ export function options(state) {
     const f = state.fences?.[c.at];
     if (f) {
       acts.push({ type: "fence-bin", price: PLACEHOLDER.fence.binPrice, size: PLACEHOLDER.fence.binSize, allowed: c.coins >= PLACEHOLDER.fence.binPrice });
-      f.stock.forEach((card, i) => { const price = Math.max(1, buyRound(here.suits, card)(cardValue(card) * buyMult(here.suits, card) * INFL)); acts.push({ type: "fence-buy", i, card, price, allowed: c.coins >= price && slots(c) < c.capacity }); });
-      c.cargo.forEach((card, i) => { if (illicit(card)) acts.push({ type: "fence-sell", i, card, price: Math.max(1, Math.round(cardValue(card) * sellMult(here.suits, card) * INFL)), endsRun: counted(c) - 1 < RULES.cargoMinimum }); });
+      // the Fence's counter prices like the settlement's market: suit multipliers, its demand and the ability modifiers (D-931; D-1240)
+      const fm = state.markets[c.at] || { suits: here.suits || [], tier: here.tier, demand: {} };
+      f.stock.forEach((card, i) => { const price = buyPrice(fm, card); acts.push({ type: "fence-buy", i, card, price, allowed: c.coins >= price && (isCorr(card) || slots(c) < c.capacity) }); });
+      // Corruption cards from your personal deck (D-751, D-764, D-773, D-775): glitched ones at a mediocre price; a Receipt turns into
+      // five basic commodities; a Lottery Ticket rolls its win; other identified cards a small price. Prices PLACEHOLDER
+      c.personal.forEach((card, i) => { if (isCorr(card)) acts.push({ type: "corr-sell", i, card, price: isGlitched(card) ? PLACEHOLDER.corruption.glitchSale : isCorr(card, "receipt") || isCorr(card, "lottery") ? 0 : PLACEHOLDER.corruption.cardSale }); });
+      c.cargo.forEach((card, i) => { if (illicit(card)) acts.push({ type: "fence-sell", i, card, price: sellPrice(fm, card), endsRun: counted(c) - 1 < RULES.cargoMinimum }); });
       // smuggled valuables (D-417): foreign-origin X and Ász, after crossing into another region
       c.cargo.forEach((card, i) => { if ((card.rank === "X" || card.rank === "Ász") && card.home != null && card.home !== regionNo(state))
         acts.push({ type: "fence-smuggle", i, card, from: card.home, distance: smuggleDistance(card.home, regionNo(state)), price: smugglePrice(state, card), endsRun: counted(c) - 1 < RULES.cargoMinimum }); });
@@ -263,7 +311,7 @@ export function options(state) {
     // upgrade services (D-112, D-113, D-302, D-620; subset and DRAFT prices in upgrades.js): your cards in cargo or the personal deck
     const services = here.services || [];
     // Cheap Labour (Industrious Tradesfolk Alsó in the personal deck) cuts Guild refinement; Special Treatment cuts all upgrades
-    const labour = c.personal.some(TRADES.industrious) ? PLACEHOLDER.cheapLabour : 0;
+    const labour = two(c.personal.filter(TRADES.industrious)).length * PLACEHOLDER.cheapLabour;   // two copies at most (D-352)
     // Beast of Burden at Grey Cattle: settlement services 10 % cheaper where Plainsfolk live (not commodity prices)
     // Local Discount (Citizenship Papers): paid settlement services in towns and cities, at most two copies (D-260)
     const local = isTownOrCity(here) ? Math.min(2, c.personal.filter(TOWNS.citizen).length) * PLACEHOLDER.localDiscount : 0;
@@ -272,22 +320,36 @@ export function options(state) {
     const tempt = (here.suits || []).includes("Forestfolk") ? 0 : Math.max(0, ...c.personal.filter((x) => FOREST.beaver(x) && x.refined >= 1).map((x) => (x.refined >= 2 ? 0.15 : 0.1)));
     for (const deck of ["cargo", "personal"]) c[deck].forEach((card, i) => offers(card, services).forEach((o) => {
       // Forge Discount (Thrifty Blacksmith line, personal deck): refining Hillfolk VIII and X 30 % cheaper
-      const net = card.suit === "Fisherfolk" && c.personal.some(FISH.canny) ? 0.2 : 0;   // Networking (Canny Helmsman line; ABL-21: one copy)
-      const forge = o.track === "refine" && card.suit === "Hillfolk" && (card.rank === "VIII" || card.rank === "X") && c.personal.some(HILL.thrifty) ? 0.3 : 0;
-      const price = discounted(c, Math.ceil(o.price * INFL), cattle + solitude(c) + forge + net + (o.track === "refine" && o.at === "Guild" ? labour : 0) + (o.track === "refine" ? tempt : 0));
+      const net = card.suit === "Fisherfolk" ? 0.2 * two(c.personal.filter(FISH.canny)).length : 0;   // Networking (Canny Helmsman line; ABL-21 resolved by D-352: two at most)
+      const forge = o.track === "refine" && card.suit === "Hillfolk" && (card.rank === "VIII" || card.rank === "X") ? 0.3 * two(c.personal.filter(HILL.thrifty)).length : 0;
+      // Cheap Labour cuts refining goods (commodities) at the Guild, not character cards (tok.md "refining goods"; D-1204)
+      const goods = o.track === "refine" && E.isCommodity(card);
+      const price = discounted(c, Math.ceil(o.price * INFL), cattle + solitude(c) + forge + net + (goods && o.at === "Guild" ? labour : 0) + (o.track === "refine" ? tempt : 0), goods);
       acts.push({ type: "upgrade", deck, i, card, ...o, price, listPrice: o.price, allowed: c.coins >= price });
     }));
     // the Church sells Attrition (D-302, D-726): a rank-standard ability for one card, played sideways (D-101); price PLACEHOLDER
     if (services.includes("Church")) for (const deck of ["cargo", "personal"]) c[deck].forEach((card, i) => {
       const price = discounted(c, PLACEHOLDER.churchAttrition, cattle + solitude(c));
-      if (!card.attrition) acts.push({ type: "attrition", deck, i, card, price, allowed: c.coins >= price });
+      // mercenary and Corruption cards are rankless: no rank-standard Attrition (D-336, D-054, D-348; D-1204)
+      if (!card.attrition && !card.merc && !isCorr(card)) acts.push({ type: "attrition", deck, i, card, price, allowed: c.coins >= price });
     });
+    // wagon capacity bought at the Magistrates (D-394, D-553): unlocked slots on top of the 32 (and of the 40 wagon); amount, price
+    // and how many PLACEHOLDER (D-1200)
+    if (services.includes("Magistrates")) { const W = PLACEHOLDER.wagonUpgrade, n = (c.wagonSlots || 0) / W.slots;
+      if (n < W.max) { const price = discounted(c, Math.ceil(W.prices[n] * INFL), cattle + solitude(c), true); acts.push({ type: "wagon-slots", slots: W.slots, price, allowed: c.coins >= price }); } }
+    // the church identifies glitched Corruption cards (D-726, D-751, D-755): expensive, dearer after each one this run; a Library
+    // Card pays for one without raising the price (D-768)
+    if (services.includes("Church")) { const n = state.run?.identified || 0, lib = c.personal.some((x) => isCorr(x, "library"));
+      c.personal.forEach((card, i) => { if (!isGlitched(card)) return; const price = identifyPrice(n);
+        acts.push({ type: "identify", i, card, price, allowed: c.coins >= price });
+        if (lib) acts.push({ type: "identify", i, card, price: 0, library: true, allowed: true }); }); }
     if (here.castleTown) { acts.push({ type: "royal-castle" }); acts.splice(acts.findIndex((x) => x.type === "leave"), 1); }   // every journey ends here (D-757)      // the final inspection (D-432): only from Castle Town (D-442)
     return { phase: "location", here, services, market: m, actions: acts, church: services.includes("Church") };
   }
+  if (state.phase === "shortfall") return { phase: "shortfall", here, requirement: requirementStatus(state), actions: [requirementBribe(state), { type: "accept-shortfall" }].filter(Boolean) };
   if (state.phase === "checkpoint") {
     const acts = [{ type: "submit" }, ...briberyOffers(state)];
-    const rb = requirementBribe(state); if (rb) acts.push(rb);
+    const rb = requirementBribe(state); if (rb) acts.push({ ...rb, type: "req-bribe-preview" });   // offered at evaluation, after submitting (D-107; D-1242)
     // the emergency return (D-109, D-719): always shown, with the reason when it can't be taken (D-119). It costs its two
     // highway tolls, 5 + 5, paid in COINS ONLY: card substitution (D-860) doesn't apply to this special action (D-871 (1),
     // D-323); toll abilities apply by their own text
@@ -331,15 +393,22 @@ export function options(state) {
 }
 
 // ---------------------------------------------------------------- actions
+// the run's money tallies (D-416, D-748): every change to the caravan's coins counts as it happens, wherever it comes from (a
+// toll and the arrival income of one move both count; duels, trades and tolls between caravans too); moving money in and out of an
+// investment is neither (D-1239)
+function coinLedger(state) {
+  const c = state.caravan; let v = c.coins;
+  Object.defineProperty(c, "coins", { enumerable: true, configurable: true, get: () => v,
+    set: (n) => { const d = n - v; v = n; if (d && state.run && !state.noTally) { if (d > 0) state.run.earned += d; else state.run.spent -= d; } } });
+}
 export function act(state, action) {
-  const c = state.caravan, coins0 = c.coins, m = state.phase === "match" && state.match ? state.match.m : null;
-  const out = actInner(state, action);
-  // the run's tallies (D-416): money earned and spent (investing isn't spending and withdrawing isn't earning, D-748), tricks won
-  // and matches won by your side
-  if (state.run && !["invest", "withdraw", "close-investment"].includes(action.type)) { const d = c.coins - coins0; if (d > 0) state.run.earned += d; else state.run.spent -= d; }
+  const m = state.phase === "match" && state.match ? state.match.m : null;
+  state.noTally = ["invest", "withdraw", "close-investment"].includes(action.type);
+  let out; try { out = actInner(state, action); } finally { state.noTally = false; }
+  // tricks won and matches won by your side (D-416)
   if (state.run && m && action.type === "match-done" && state.match?.m !== m) {
     state.run.tricks += (m.history || []).filter((t) => t.team === 0).length;
-    if (m.result === "win" && state.match?.kind !== "checkpoint") state.run.games += 1;
+    if (m.result === "win") state.run.games += 1;   // every Zsír game won, the checkpoint's included (D-416 names no exclusion; D-1245)
   }
   tagHome(state);
   return out;
@@ -379,15 +448,21 @@ function actInner(state, action) {
   if (action.type === "merc-shop") return buyFromProfiteer(state, options(state), action);
   // choosing your partner for the coming encounters: the companion (null) or a mercenary you own (D-156, D-199)
   if (action.type === "set-partner") { const c = state.caravan; if (action.merc != null && !c.personal.some((x) => x.merc === action.merc)) throw new Error("not your mercenary"); c.partner = action.merc ?? null; return; }
-  trader = state.caravan;
+  trader = state.caravan; traderState = state;
   const opts = options(state);
   if (opts.phase === "ended") return;
   const c = state.caravan;
   if (opts.phase === "declare" && action.type === "move") return move(state, opts, action);
   if (opts.phase === "match-offer" && (action.type === "accept" || action.type === "decline")) return locationMatch(state, action.type === "accept");
+  if (opts.phase === "excursion-offer" && action.type === "excursion") return excursion(state, !!action.go);
+  if (opts.phase === "cp-event" && (action.type === "cp-play" || action.type === "cp-skip")) return cpEvent(state, action.type === "cp-play");
   if (opts.phase === "loot" && action.type === "take") {
     const a = opts.actions.find((x) => x.type === "take" && x.i === action.i); if (!a || !a.allowed) throw new Error("no room");
     const [card] = state.loot.cards.splice(action.i, 1); state.caravan.cargo.push(card); note(state, `Looted ${cardName(card)}.`); return;
+  }
+  if (opts.phase === "loot" && action.type === "leave-own") {
+    const a = opts.actions.find((x) => x.type === "leave-own" && x.i === action.i); if (!a || !a.allowed) throw new Error("you can't leave that");
+    const out = removeCargo(state.caravan, a.card); state.loot.cards.push(...out); note(state, `Left ${out.map(cardName).join(", ")} on the pile.`); return;
   }
   if (opts.phase === "loot" && action.type === "done-loot") { if (state.loot.cards.length) note(state, `Left behind: ${state.loot.cards.length} card${state.loot.cards.length === 1 ? "" : "s"}.`); state.loot = null; state.phase = "declare"; return; }
   if (opts.phase === "match" && action.type === "match-done" && opts.actions.length)
@@ -428,7 +503,11 @@ function actInner(state, action) {
   if (opts.phase === "location" && action.type === "leave") { state.phase = "declare"; return; }
   if (opts.phase === "location" && ["buy", "sell", "restock"].includes(action.type)) return market(state, opts, action);
   if (opts.phase === "location" && action.type === "upgrade") return upgrade(state, opts, action);
-  if (opts.phase === "location" && ["fence-bin", "fence-buy", "fence-sell", "fence-smuggle"].includes(action.type)) return fence(state, opts, action);
+  if (opts.phase === "location" && ["fence-bin", "fence-buy", "fence-sell", "fence-smuggle", "corr-sell"].includes(action.type)) return fence(state, opts, action);
+  if (opts.phase === "location" && action.type === "identify") return identifyAt(state, opts, action);
+  if (opts.phase === "location" && action.type === "wagon-slots") { const a = opts.actions.find((x) => x.type === "wagon-slots"); if (!a || !a.allowed) throw new Error("not available");
+    const c = state.caravan; c.coins -= a.price; c.wagonSlots = (c.wagonSlots || 0) + a.slots; c.capacity = capacity(c);
+    note(state, `Magistrates: your wagon is licensed for ${a.slots} more slots (capacity ${c.capacity}) for ${a.price} coins (D-394).`, "good"); return; }
   if (opts.phase === "location" && action.type === "royal-castle" && opts.actions.some((x) => x.type === "royal-castle")) {
     state.final = true; note(state, "You ride up to the Royal Castle. The final inspection, the harshest of the run (D-432): failure ends the run.", "warn");
     state.sabotageRolled = false; state.sabotage = false; sabotage(state);   // any checkpoint, the final one included (D-657)
@@ -462,14 +541,21 @@ function actInner(state, action) {
   if (opts.phase === "checkpoint" && action.type === "submit") return submit(state);
   if (opts.phase === "checkpoint" && action.type === "bribery") {
     const a = opts.actions.find((x) => x.type === "bribery" && x.i === action.i && (x.deck || "cargo") === (action.deck || "cargo")); if (!a || !a.allowed) throw new Error("not available");
-    const b = (state.cpBribery ||= { used: [], pct: 0 }); b.used.push(a.card); b.pct += a.pct; state.caravan.coins -= a.price;
+    const b = (state.cpBribery ||= { used: [], pct: 0, military: 0 }); b.used.push(a.card); state.caravan.coins -= a.price;
+    // allocated to concealment or to military strength (tok.md: "allocated between concealment and military strength"; D-1203)
+    if (action.alloc === "military") { b.military = (b.military || 0) + a.military;
+      note(state, `Bribery: ${cardName(a.card)} buys ${a.military} military for ${a.price} coins (now +${b.military} at this checkpoint).`, "good"); return; }
+    b.pct += a.pct;
     note(state, `Bribery: ${cardName(a.card)} buys ${Math.round(a.pct * 100)}% concealment for ${a.price} coins (now ${Math.round(b.pct * 100)}%).`, "good"); return;
   }
-  if (opts.phase === "checkpoint" && action.type === "req-bribe") {
+  // requirement bribery at evaluation, after the irreversible submission (D-107, D-108; D-1242): pay, or the run ends
+  if (opts.phase === "shortfall" && action.type === "req-bribe") {
     const a = opts.actions.find((x) => x.type === "req-bribe"); if (!a || !a.allowed) throw new Error("not available");
     state.caravan.coins -= a.price; state.reqBribed = (state.reqBribed || 0) + a.missing;
-    note(state, `Requirement bribe: ${a.price} coins cover the ${a.missing} missing card${a.missing === 1 ? "" : "s"} (D-108).`, "good"); return;
+    note(state, `Requirement bribe: ${a.price} coins cover the ${a.missing} missing card${a.missing === 1 ? "" : "s"} (D-108).`, "good");
+    state.phase = "checkpoint"; return afterRequirements(state, requirementStatus(state));
   }
+  if (opts.phase === "shortfall" && action.type === "accept-shortfall") { state.phase = "checkpoint"; return endShort(state, requirementStatus(state)); }
   if (opts.phase === "checkpoint" && (action.type === "cp-buy" || action.type === "cp-sell")) {
     const a = opts.actions.find((x) => x.type === action.type && x.i === action.i);
     if (!a || a.allowed === false) throw new Error("not available");
@@ -490,7 +576,8 @@ function move(state, opts, action) {
   // pay each fee in coins or with one random cargo card, weighted towards száraz cargo (D-860 (1), D-861)
   m.fees.forEach((f, i) => {
     if (f.robbery) { c.coins += f.robbery; note(state, `Highway Robbery: you collect ${f.robbery} coins from the toll-booth instead of paying.`, "good"); }
-    else if (f.waived) note(state, `No fee: ${f.label.replace(/^.*\((?:waived: )?(.*)\)$/, "$1")}.`, "good");
+    else if (f.waived) { note(state, `No fee: ${f.label.replace(/^.*\((?:waived: )?(.*)\)$/, "$1")}.`, "good");
+      if (f.tram) { const k = c.personal.findIndex((x) => isCorr(x, "tram")); if (k >= 0) { c.personal.splice(k, 1); note(state, "The tram ticket is used up."); } } }
     else if (pay[i] === "coins" && c.coins >= f.amount) { c.coins -= f.amount; note(state, `Paid ${f.amount} coins: ${f.label}.`); }
     else if (c.cargo.length) {
       const card = takeRandomCargo(state);
@@ -498,6 +585,8 @@ function move(state, opts, action) {
     }
   });
   c.onHighway = m.leg.segments[m.leg.segments.length - 1].cls === "highway";
+  // Waterways arriving at a highway stop enters the highway mid-journey, past the gate: going on along it pays no toll (D-374; D-1243)
+  if (m.leg.waterway) c.onHighway = state.board.legs.some((l) => (l.to === m.leg.to && l.segments[l.segments.length - 1]?.cls === "highway") || (l.from === m.leg.to && l.segments[0]?.cls === "highway"));
   c.at = m.leg.to; state.visited.add(c.at);
   const to = state.stops[c.at];
   note(state, `Moved to ${describe(to)} (stop ${to.stop}).`, "move");
@@ -548,7 +637,7 @@ function roadAbilities(state, leg) {
   if (dest && (dest.suits || []).includes("Hillfolk")) for (const _ of two(c.personal.filter(HILL.smiths))) if (r.next() < luck(state, 0.5)) hillGain("Resource Acquisition");
   // Foraging and Hunting (Forester's Papers, personal deck): an off-highway move, whatever its destination, brings 1-3 ordinary VIII
   // (quantity provisional; suit unstated: any, D-353), space permitting (D-504, D-736)
-  if (offHighway && c.personal.some(FOREST.papers)) {
+  for (const _ of offHighway ? two(c.personal.filter(FOREST.papers)) : []) {   // two at most (D-352)
     const n = 1 + Math.floor(r.next() * 3);
     for (let k = 0; k < n; k++) { const v = r.pick(E.stagesOf((x) => x.rank === "VIII" && x.stage === 0 && x.roster !== "secret alternative"));
       if (slots(c) < c.capacity) { c.cargo.push(E.cardFromStage(v)); growl(state, `Foraging and Hunting: ${v.name} from the wild.`); } else { growl(state, "Foraging and Hunting: the wagon is full (D-736)."); break; } }
@@ -571,6 +660,14 @@ function roadAbilities(state, leg) {
     const v = r.pick(E.stagesOf((x) => ["Farmfolk", "Plainsfolk", "Forestfolk"].includes(x.suit) && x.rank === "VIII" && x.stage === 0 && x.roster !== "secret alternative"));
     if (slots(c) < c.capacity) { c.cargo.push(E.cardFromStage(v)); growl(state, `Crop Raiding: ${v.name} lifted from a field.`); } else growl(state, "Crop Raiding: the wagon is full (D-736).");
   }
+  // Field Research (Felső) resolves before Fealty (Király): end-of-road effects in rank order (D-402; D-1204). On a non-highway road, one upgraded Farmfolk VIII (rarely a Farmfolk X); space permitting (D-736)
+  for (const _ of leg.segments.some((g) => g.cls !== "highway") ? two(c.personal.filter(FARMFOLK.wise)) : []) {   // two at most (D-352)
+    const x = r.next() < luck(state, PLACEHOLDER.fieldResearchXChance);
+    const pool = E.stagesOf((s) => s.suit === "Farmfolk" && s.rank === (x ? "X" : "VIII") && (x || s.stage >= 1));
+    const card = E.cardFromStage(r.pick(pool));
+    if (slots(c) < c.capacity) { c.cargo.push(card); growl(state, `Field Research: you find ${cardName(card)} along the way.`); }
+    else growl(state, `Field Research found ${cardName(card)}, but the wagon is full (D-736).`);
+  }
   // Fealty: 2 coins per complete group of 4 Farmfolk produce (VIII, X) carried
   const lords = Math.min(2, c.personal.filter(FARMFOLK.prosperous).length);   // D-352
   if (lords) { const n = Math.floor(c.cargo.filter(FARMFOLK.produce).length / 4) * 2 * lords; if (n) { c.coins += n; growl(state, `Fealty: your tenants pay ${n} coins.`); } }
@@ -579,6 +676,19 @@ function roadAbilities(state, leg) {
     if (slots(c) < c.capacity) { c.cargo.push({ rank: "Alsó", suit: "Clergy" }); growl(state, "Pilgrimage: a pilgrim joins your caravan (Clergy Alsó)."); }
     else growl(state, "Pilgrimage: a pilgrim would join you, but the wagon is full (D-736).");
   }
+  // Scriptoria (Meticulous alternative Clergy Alsó, personal deck; each journey; two at most): 50 % to turn 1 basic Forestfolk Hides
+  // in cargo into basic Clergy Parchment (quantity PLACEHOLDER 1: open until commodity values exist); the Scribe adds an independent
+  // 5 % to turn 1 Fine Vellum into 1 basic Scriptures; with no cargo room the conversion fails (D-568, D-569)
+  for (const x of salted(state) ? [] : two(c.personal.filter(ALT_CLERGY.meticulous))) {   // Salt Cure stops it (D-581, D-654)
+    const hides = c.cargo.find((y) => y.suit === "Forestfolk" && y.rank === "VIII" && !y.refined && (y.name || "Hides") === "Hides" && (!y.roster || y.roster === "main"));
+    if (hides && r.next() < luck(state, 0.5)) {
+      const out = Array.from({ length: PLACEHOLDER.scriptoriaParchment }, () => ({ rank: "VIII", suit: "Clergy", roster: "alternative", name: "Parchment" }));
+      if (slots(c) - 1 + out.length <= c.capacity) { c.cargo.splice(c.cargo.indexOf(hides), 1, ...out); growl(state, `Scriptoria: Hides become ${out.length} Parchment.`); }
+      else growl(state, "Scriptoria: no room in the wagon for the Parchment (D-569).");
+    }
+    const vel = ALT_CLERGY.scribe(x) && c.cargo.find((y) => y.suit === "Clergy" && y.rank === "VIII" && y.roster === "alternative" && (y.refined || 0) >= 2);
+    if (vel && r.next() < luck(state, 0.05)) { c.cargo.splice(c.cargo.indexOf(vel), 1, { rank: "X", suit: "Clergy", name: "Scriptures" }); growl(state, "Scriptoria: the Scribe turns Fine Vellum into Scriptures."); }
+  }
   // Beasts in cargo, each road, highways included, capacity applies (wild.md): Rooting (a Beasts VIII), Spore Spread (a
   // Mushrooms), King of the Forest (a random ordinary Beasts card: VII-Király weight 2, X and Ász 1); 50 % each
   const beastGain = (g, what) => { if (slots(c) < c.capacity) { c.cargo.push(g); growl(state, what); } else growl(state, `${what.split(":")[0]}: the wagon is full (D-736).`); };
@@ -586,8 +696,10 @@ function roadAbilities(state, leg) {
   for (const _ of c.cargo.filter(BEASTS.bountiful)) if (r.next() < luck(state, 0.5)) beastGain({ rank: "VIII", suit: "Beasts", name: "Mushrooms", roster: "main" }, "Spore Spread: fresh Mushrooms sprout in the wagon.");
   for (const _ of c.cargo.filter(BEASTS.mighty)) if (r.next() < luck(state, 0.5)) {
     const rank = r.weighted(["VII", "VIII", "IX", "X", "Alsó", "Felső", "Király", "Ász"], (x) => (x === "X" || x === "Ász" ? 1 : 2));
-    const v = E.isCommodity({ rank }) && E.stagesOf((s) => s.suit === "Beasts" && s.rank === rank && s.stage === 0 && s.roster === "main")[0];
-    const g = v ? E.cardFromStage(v) : { rank, suit: "Beasts" }; beastGain(g, `King of the Forest: ${cardName(g)} follows the bear.`);
+    // the roster of the place the road reaches, as its decks are dealt (agricultural by the map, D-489; your answer, D-1222); a
+    // commodity in any version, alternatives included (D-487)
+    const dest = state.stops[leg.to], v = E.poiDeckCard(r, null, null, null, dest?.beasts_roster, E.placeCtx(dest))(rank, "Beasts");
+    const g = { rank, suit: "Beasts", ...Object.fromEntries(Object.entries(v || {}).filter(([, x]) => x !== undefined)) }; beastGain(g, `King of the Forest: ${cardName(g)} follows the bear.`);
   }
   // Dowry (Surprising rural Chest line, cargo or personal deck; two at most): each journey 10 / 15 / 20 % for a random unrefined X
   // of any suit in cargo, space permitting (D-549)
@@ -608,7 +720,7 @@ function roadAbilities(state, leg) {
   }
   // Noble Rot (Decadent Noble Rot Harvest in cargo): each journey, 5 % for another Decadent Noble Rot Harvest and 50 % to rot
   // one other Sweet Grapes into Noble Rot Harvest; new ones don't act this journey (D-563, D-564)
-  for (const x of c.cargo.filter((y) => decadent(y) && y.refined === 1)) {
+  for (const x of two(c.cargo.filter((y) => decadent(y) && y.refined === 1))) {   // two at most (D-352)
     if (r.next() < 0.05 && slots(c) < c.capacity) { c.cargo.push({ rank: "X", suit: "Farmfolk", roster: "alternative", refined: 1, adjective: "Decadent", line: "Sweet Grapes", name: "Decadent Noble Rot Harvest" }); growl(state, "Noble Rot: the rot spreads to a new crate."); }
     const sw = c.cargo.filter((y) => ALT.sweet(y) && !y.refined && y !== x);
     if (sw.length && !salted(state) && r.next() < 0.5 + temper(state)) { const t = r.pick(sw); const before = cardName(t); applyUpgrade(t, "refine"); growl(state, `Noble Rot: ${before} turns into ${cardName(t)}.`); }
@@ -624,7 +736,7 @@ function roadAbilities(state, leg) {
     const k = c.cargo.findIndex(conscript); c.cargo.splice(k, 1, { rank: "VII", suit: "King's Men" }); growl(state, "Basic Training: a Conscript is drilled into a King's Men Infantryman.");
   }
   // Roadside Refinement (Shrewd Bandits Felső): each refines one Bandits VIII in cargo per road, free (least refined first)
-  for (const _ of salted(state) ? [] : c.personal.filter(BANDITS.shrewd)) {
+  for (const _ of salted(state) ? [] : two(c.personal.filter(BANDITS.shrewd))) {   // two at most (D-352)
     const el = c.cargo.filter((x) => x.suit === "Bandits" && x.rank === "VIII" && (x.refined || 0) < 2);   // "one Bandits VIII" (thug.md)
     if (!el.length) break;
     const t = r.pick(el);                                       // unspecified selection is random (ABL-20)
@@ -641,14 +753,6 @@ function roadAbilities(state, leg) {
   }
   // Shearing (Shaggy Racka Sheep): each one, 50 % per journey for one Wool
   for (const _ of c.personal.filter(PLAINS.shaggy)) if (r.next() < luck(state, 0.5)) gain({ rank: "VIII", suit: "Plainsfolk", refined: 1, name: "Wool" }, "Shearing: a bale of Wool.");
-  // Field Research: on a non-highway road, one upgraded Farmfolk VIII (rarely a Farmfolk X); space permitting (D-736)
-  if (c.personal.some(FARMFOLK.wise) && leg.segments.some((g) => g.cls !== "highway")) {
-    const x = r.next() < luck(state, PLACEHOLDER.fieldResearchXChance);
-    const pool = E.stagesOf((s) => s.suit === "Farmfolk" && s.rank === (x ? "X" : "VIII") && (x || s.stage >= 1));
-    const card = E.cardFromStage(r.pick(pool));
-    if (slots(c) < c.capacity) { c.cargo.push(card); growl(state, `Field Research: you find ${cardName(card)} along the way.`); }
-    else growl(state, `Field Research found ${cardName(card)}, but the wagon is full (D-736).`);
-  }
 }
 // the rural Townsfolk roster on the road (townsfolk-rural.md): Grist (Stitched Millstone / Millstone Pair in cargo, arriving at a
 // settlement) before Milling (Gruelling Felső, personal deck), as the X resolves before the Felső (D-402); then Gathering Hike
@@ -711,7 +815,8 @@ function settlementAbilities(state, here) {
   // or Plainsfolk VIII (a random mix where both live)
   if (farmPlains.length && c.personal.some(PLAINS.papers) && c.cargo.length <= 10) {
     const add = 12 - c.cargo.length;
-    for (let k = 0; k < add; k++) c.cargo.push(E.cardFromStage(state.rng.pick(E.stagesOf((s) => s.suit === state.rng.pick(farmPlains) && s.rank === "VIII" && s.stage === 0 && s.roster === "main"))));
+    for (let k = 0; k < add; k++) { const suit = state.rng.pick(farmPlains);   // one suit per card, picked before the filter
+      c.cargo.push(E.cardFromStage(state.rng.pick(E.stagesOf((s) => s.suit === suit && s.rank === "VIII" && s.stage === 0 && (s.roster === "main" || s.roster === "alternative"))))); }   // any version (D-487)
     growl(state, `Hospitality: the locals fill your wagon with ${add} sacks and fleeces.`);
   }
   // What a Catch! (Voracious Sterlet line, personal deck; two at most): each settlement visit, 50 % for a basic Fisherman in cargo
@@ -733,6 +838,12 @@ function settlementAbilities(state, here) {
     const n = bulls.reduce((a, b) => a + PLACEHOLDER.studServiceCoins * (b.refined >= 2 ? 2 : 1), 0);
     if (n) { c.coins += n; growl(state, `Stud Service: ${n} coins from the village's farmers.`); }
   }
+  // Alms (Selfless alternative Clergy Ász, personal deck): on arrival at a settlement, by the best stage (non-cumulative): Drifter
+  // 20 % for 5 coins, Wayfarer 40 % for 8, Good Samaritan 50 % for 10; a Clergy Ász income, so Sacred Teachings adds (D-565, D-384)
+  { const al = c.personal.filter(ALT_CLERGY.selfless).sort((a, b) => (b.refined || 0) - (a.refined || 0))[0];
+    if (al) { const [p, n] = [[0.2, 5], [0.4, 8], [0.5, 10]][al.refined || 0];
+      if (state.rng.next() < luck(state, p)) { const bonus = c.personal.filter(CLERGY.revered).reduce((a, x) => a + PLACEHOLDER.sacredTeachingsBonus * (1 + (x.refined || 0)), 0);
+        c.coins += n + bonus; growl(state, `Alms: the people of ${here.name} give ${n + bonus} coins in gratitude.`); } } }
   // Patronage (Esteemed Clergy Felső): at a town, income by the Clergy face cards in cargo; Sacred Teachings (Revered X) adds
   if (isTownOrCity(here) && c.personal.some(CLERGY.esteemed)) {
     const faces = c.cargo.filter(CLERGY.face).length;
@@ -743,7 +854,7 @@ function settlementAbilities(state, here) {
   // Kickbacks (Greedy Townsfolk VII in cargo): each one, on entering a settlement, a bribe: coins or one rank VIII cargo card
   // (odds, amounts and pool PLACEHOLDER: urban.md leaves them TBD)
   const K = PLACEHOLDER.kickbacks;
-  for (const _ of c.cargo.filter(TOWNS.greedy)) {
+  for (const _ of two(c.cargo.filter(TOWNS.greedy))) {   // a settlement ability: two copies at most, each rolling on its own (D-260, D-533; D-1208)
     if (state.rng.next() < K.coinChance) { const n = K.coins[here.tier] ?? K.coins.town; c.coins += n; growl(state, `Kickbacks: the watchman pockets ${n} coin${n === 1 ? "" : "s"} for you.`); }
     else { const pool = E.stagesOf((s) => s.rank === "VIII" && s.stage === 0);   // D-353: every commodity type, any region
       const g = pool.length ? E.cardFromStage(state.rng.pick(pool)) : { rank: "VIII", suit: state.rng.pick(here.suits || SUITS) };
@@ -768,16 +879,16 @@ function settlementAbilities(state, here) {
   if (!(here.suits || []).includes("Carnivalfolk")) {
     const busk = Math.min(2, c.personal.filter(CARNIVAL.charming).length) * 2;   // D-352, D-533                                    // Street Performance
     if (busk) { c.coins += busk; growl(state, `Street Performance: ${busk} coins from the square.`); }
-    const toys = c.cargo.filter(CARNIVAL.lively).reduce((a, x) => a + 1 + (x.refined || 0), 0);     // Crowd Favourite 1 / 2 / 3
+    const toys = best2(c.cargo.filter(CARNIVAL.lively).map((x) => 1 + (x.refined || 0)));     // Crowd Favourite 1 / 2 / 3; two at most (D-352)
     if (toys) { c.coins += toys; growl(state, `Crowd Favourite: the children pay ${toys} coin${toys === 1 ? "" : "s"} to see your toys.`); }
     const add = (card, what) => { if (slots(c) < c.capacity) { c.cargo.push(card); growl(state, what); } else growl(state, `${what.split(":")[0]}: the wagon is full (D-736).`); };
     for (const _ of two([...c.cargo, ...c.personal].filter(CARNIVAL.deft))) {                           // Payment in Kind
-      const g = E.cardFromStage(state.rng.pick(E.stagesOf((s) => s.rank === "VIII" && s.stage === 0 && s.roster === "main")));
+      const g = E.cardFromStage(state.rng.pick(E.stagesOf((s) => s.rank === "VIII" && s.stage === 0 && s.roster !== "secret alternative")));   // every commodity type (D-353, D-487)
       add(g, `Payment in Kind: the audience pays in ${cardName(g)}.`);
     }
     for (const _ of two(c.personal.filter(CARNIVAL.resounding))) if (state.rng.next() < luck(state, 0.75)) {        // Roll Up! 75 %
       const suit = state.rng.pick(here.suits || SUITS), rank = state.rng.pick(["Alsó", "Felső", "Király", "VII"]), x = state.rng.next();
-      const g = { rank, suit }; const e = upgradeEntry(g);
+      const g = localVersion(state, here, rank, suit); const e = upgradeEntry(g);
       if (x >= 0.9 && e && e.adjective) applyUpgrade(g, "adjective"); else if (x >= 0.7 && e) applyUpgrade(g, "refine"); else if (x >= 0.7) g.refined = 1;
       add(g, `Roll Up!: ${cardName(g)} joins the show.`);
     }
@@ -788,8 +899,8 @@ function settlementAbilities(state, here) {
   for (const x of two(c.personal.filter((y) => ALT.koboz(y) && y.adjective === "Enchanting"))) {
     const ranks = [["Alsó"], ["Alsó", "Felső"], ["Alsó", "Felső", "Király"]][x.refined || 0], suits = here.suits || SUITS;
     const recruit = (g, what) => { if (slots(c) < c.capacity) { c.cargo.push(g); growl(state, what); } };
-    if (state.rng.next() < luck(state, 0.5)) { const g = { rank: state.rng.pick(ranks), suit: state.rng.pick(suits) }; recruit(g, `Enchanting: the music draws in ${cardName(g)}.`); }
-    if (x.refined >= 2 && state.rng.next() < luck(state, 0.01)) { const g = { rank: "Ász", suit: state.rng.pick(suits) }; recruit(g, `Enchanting: the harp draws in ${cardName(g)}!`); }
+    if (state.rng.next() < luck(state, 0.5)) { const g = localVersion(state, here, state.rng.pick(ranks), state.rng.pick(suits)); recruit(g, `Enchanting: the music draws in ${cardName(g)}.`); }
+    if (x.refined >= 2 && state.rng.next() < luck(state, 0.01)) { const g = localVersion(state, here, "Ász", state.rng.pick(suits)); recruit(g, `Enchanting: the harp draws in ${cardName(g)}!`); }
   }
   // Odd Jobs (Hardworking rural Porter, personal deck; two at most): each settlement visit, 50 % for 1 coin (Apprentice 2) (D-532, D-533)
   for (const x of two(c.personal.filter(RURAL.hardworking))) if (state.rng.next() < luck(state, 0.5)) { const n = x.refined >= 1 ? 2 : 1; c.coins += n; growl(state, `Odd Jobs: ${n} coin${n === 1 ? "" : "s"} for a day's carrying.`); }
@@ -799,7 +910,7 @@ function settlementAbilities(state, here) {
   // Master Craftsmanship (Diligent Tradesfolk Felső in the personal deck): refines one Tradesfolk VIII in cargo, free; the
   // card is chosen at random (ABL-20); two copies at most (D-352)
   for (const _ of salted(state) ? [] : two(c.personal.filter(TRADES.diligent))) {
-    const el = c.cargo.filter((x) => x.suit === "Tradesfolk" && x.rank === "VIII" && (!x.roster || x.roster === "main") && (x.refined || 0) < 2);
+    const el = c.cargo.filter((x) => x.suit === "Tradesfolk" && x.rank === "VIII" && (!x.roster || x.roster === "main" || x.roster === "rural roster") && (x.refined || 0) < 2);   // rural Ironware too (D-1204)
     if (!el.length) break;
     const t = state.rng.pick(el);
     const before = cardName(t); applyUpgrade(t, "refine"); afterRefine(state, t);
@@ -858,7 +969,9 @@ function arrive(state) {
     if (c.personal.some(CARNIVAL.madcap) && state.mode !== "playtest") {
       if (state.rng.next() < 0.5) { const old = state.requirement.title; let r, k = 0;
         do { r = drawScenario(state.reqCtx, null); } while (r.title === old && k++ < 20);
-        state.requirement = r; note(state, `Moving the Goalposts: the guards' orders change from "${old}" to ${r.title}: ${r.ask}.`, "event"); }
+        state.requirement = r;   // one shared replacement: every caravan in the world faces the new orders (D-419; D-1238)
+        const w = state.world; if (w) for (const x of [w.player, ...(w.ais || []), ...(w.humans || [])]) if (x && (x.board?.region || 1) === (state.board.region || 1)) x.requirement = r;
+        note(state, `Moving the Goalposts: the guards' orders change from "${old}" to ${r.title}: ${r.ask}.`, "event"); }
       else note(state, "Moving the Goalposts: the orders stand (50%).");
     }
     if (!state.cpTrader) {
@@ -867,6 +980,16 @@ function arrive(state) {
       state.cpTrader = Array.from({ length: n }, () => { const rank = r.pick(RANKS_), suit = r.pick(ALL_SUITS_);
         const v = E.isCommodity({ rank }) && E.stagesOf((s) => s.suit === suit && s.rank === rank && s.stage === 0);
         return v && v.length ? E.cardFromStage(r.pick(v)) : { rank, suit }; });
+    }
+    // other encounters at the checkpoint (D-407 (2)): now and then an ordinary match with the checkpoint's four suits, or a special
+    // event: the travelling Carnival (beat a Carnival character and a guard at Zsír and you go through without an inspection, an
+    // alternative to bribery); optional; chance and split PLACEHOLDER (D-1191). Never at the Royal Castle
+    if (!state.final && !state.cpOffered && (here.suits || []).length >= 4 && state.rng.next() < PLACEHOLDER.cpEncounter.chance) {
+      state.cpOffered = true; const carnival = state.rng.next() < PLACEHOLDER.cpEncounter.carnival;
+      state.cpEvent = { kind: carnival ? "carnival" : "ordinary", suits: here.suits.slice(0, 4) };
+      note(state, carnival ? "A travelling Carnival has set up by the barrier. Beat their juggler and a bored guard at Zsír, and the guards will wave you through without an inspection (D-407)."
+                           : `Locals waiting at the checkpoint offer a game of Zsír (${here.suits.slice(0, 4).join(", ")}; optional, D-407).`, "event");
+      state.phase = "cp-event"; endRound(state); return;
     }
     state.phase = "checkpoint"; endRound(state); return;
   }
@@ -879,22 +1002,64 @@ function arrive(state) {
     // Fairground Rights (Juggler's Papers, personal deck): passive settlement income on entering +30 %, summed, rounded up
     const c0 = c.coins; settlementAbilities(state, here);
     const income = c.coins - c0;
-    if (income > 0 && c.personal.some(CARNIVAL.papers)) { const add = Math.ceil(income * 1.3) - income; c.coins += add; growl(state, `Fairground Rights: +${add} coin${add === 1 ? "" : "s"} on ${income} of income here.`); }
+    if (income > 0 && c.personal.some(CARNIVAL.papers)) { const add = Math.ceil(income * 0.3 * two(c.personal.filter(CARNIVAL.papers)).length); c.coins += add; growl(state, `Fairground Rights: +${add} coin${add === 1 ? "" : "s"} on ${income} of income here.`); }
   }
   // Confiscation (Pandúr in the personal deck): entering a location associated with the Bandits: 49 % a Bandits VIII,
   // 1 % a Bandits X, 50 % nothing (cargo rules apply)
-  if ((here.kind === "settlement" || here.kind === "poi") && c.personal.some(PLAINS.pandur) && ((here.suits || []).includes("Bandits") || here.poi === "bandit-overrun village")) {
+  // each Pandúr rolls, two at most (D-352); the seized good is any of the Bandits versions (D-487) (D-1204)
+  if ((here.kind === "settlement" || here.kind === "poi") && ((here.suits || []).includes("Bandits") || here.poi === "bandit-overrun village")) for (const _ of two(c.personal.filter(PLAINS.pandur))) {
     const x = state.rng.next(), rank = x < 0.01 ? "X" : x < luck(state, 0.5) ? "VIII" : null;
     if (!rank) growl(state, "Confiscation: the Pandúr finds nothing to seize.");
-    else { const card = E.cardFromStage(E.stagesOf((s) => s.suit === "Bandits" && s.rank === rank && s.stage === 0 && s.roster === "main")[0]);
+    else { const card = E.cardFromStage(state.rng.pick(E.stagesOf((s) => s.suit === "Bandits" && s.rank === rank && s.stage === 0 && (s.roster === "main" || s.roster === "alternative"))));
       if (slots(c) < c.capacity) { c.cargo.push(card); growl(state, `Confiscation: the Pandúr seizes ${cardName(card)}.`); } else growl(state, "Confiscation: something to seize, but the wagon is full (D-736)."); }
   }
   if (c.passenger && here.kind === "settlement") deliverPassenger(state, here);
+  seeMarket(state, here);
+  if (here.kind === "settlement" && regionNo(state) < 8) greetingRumour(state, here);
   if (here.kind === "poi" && !state.discovered.has(here.id)) { state.discovered.add(here.id); note(state, `Discovered ${describe(here)}.`); }
+  // running over capacity after losing capacity (D-375): the next settlement is the cargo-management chance; the excess is
+  // dealt with now (left behind, or sold at its market), then the arrival goes on (D-1177)
+  syncCap(state);
+  if (here.kind === "settlement" && slots(c) > c.capacity) {
+    c.overCap = 0; state.phase = "overflow"; state.afterOverflow = () => arrivalOffer(state, here);
+    note(state, `At ${here.name} you can sort the overloaded wagon (${slots(c)} of ${c.capacity}): choose what to leave behind or sell (D-375).`, "warn"); return;
+  }
+  // a minor checkpoint at the gate of a larger town (D-456): an additional light inspection by the roadside rule (D-806 (15),
+  // D-808); then the arrival goes on. Chance PLACEHOLDER (D-1180)
+  if (here.kind === "settlement" && isTownOrCity(here) && state.rng.next() < PLACEHOLDER.townMinorCheckpoint) {
+    state.event = { name: "minor checkpoint", local: here.suits || SUITS }; state.afterRoad = () => arrivalOffer(state, here);
+    note(state, `A minor checkpoint at the gate of ${here.name}: the King's Men take a look at your cargo (D-456).`, "event");
+    if (slots(c) >= 33) { note(state, `Your wagon is packed (${slots(c)} slots): the guards can't be bothered and wave you through.`, "good"); return roadDone(state); }
+    return minorCheck(state, 2, 1);
+  }
+  arrivalOffer(state, here);
+}
+function arrivalOffer(state, here) {
+  // a hidden resource site's excursion (D-704 to D-706; D-1187): its host settlement's event, offered on each visit until the site
+  // is discovered; Yes: the site is revealed and you're taken there for its resource-site encounter (it replaces this visit's
+  // settlement match), then back to the settlement's services; No: no encounter and no settlement actions this visit
+  const hs = here.kind === "settlement" && (state.hidden || []).find((h) => h.host === here.id && !state.hiddenFound.has(String(h.cell)));
+  const decided = hs && state.world?.excursions?.[`${here.id}:${state.round}`];
+  if (hs && decided !== undefined) {                       // another caravan got here first this round and decided for all (D-706 (2))
+    if (decided) { state.hiddenFound.add(String(hs.cell)); note(state, `The caravan that reached ${here.name} first this round took everyone to the ${hs.variant === "cave" ? "cave" : "mine"} nearby: you know where it is now (D-706). The visit's encounter was there.`, "event"); state.phase = "location"; endRound(state); return; }
+    note(state, `The caravan that reached ${here.name} first this round turned down the excursion, and the visit is spent for everyone here: no settlement actions (D-704, D-706).`, "warn"); state.phase = "declare"; endRound(state); return;
+  }
+  if (hs) {
+    const poi = hs.variant === "active_mine" ? "active mine" : hs.variant === "abandoned_mine" ? "abandoned mine" : "cave";
+    state.excursion = { id: here.id, name: `the ${poi} near ${here.name}`, poi, mine: hs.resource === "cave" ? null : hs.resource, suits: hs.suits, hidden: hs, cell: hs.cell };
+    state.phase = "excursion-offer";
+    note(state, `In ${here.name} they tell you: "There's ${/^[aeiou]/.test(poi) ? "an" : "a"} ${poi} in the hills nearby. You should take a look." (Go, and the visit's encounter is there; stay, and you lose this visit's settlement actions.)`, "event");
+    return;
+  }
   // D-425: arriving may reveal a Zsír match or none (procedural; frequency PLACEHOLDER); optional (D-426)
   if ((here.suits || []).length >= 4 && temp.locationOpportunity(state.rng)) {
+    // a fair, carnival or market day explains a suit that isn't really local (D-749): now and then at a settlement, Carnivalfolk
+    // take the place of one of the locals' four suits for this match; chance PLACEHOLDER (D-1199)
+    state.offerSuits = null;
+    if (here.kind === "settlement" && !here.suits.slice(0, 4).includes("Carnivalfolk") && state.rng.next() < PLACEHOLDER.fairChance) {
+      state.offerSuits = [...here.suits.slice(0, 3), "Carnivalfolk"]; note(state, `It's fair day in ${here.name}: performers and traders from elsewhere are in town (Carnivalfolk join the deck).`, "event"); }
     state.phase = "match-offer";
-    note(state, `A Zsír match is on offer at ${here.name} (optional, D-426): the locals' four suits are ${here.suits.join(", ")}.`
+    note(state, `A Zsír match is on offer at ${here.name} (optional, D-426): the locals' four suits are ${(state.offerSuits || here.suits).join(", ")}.`
       + (here.kind === "poi" && E.poiDeckNote(here) ? ` ${E.poiDeckNote(here)}` : ""));
     return;
   }
@@ -909,11 +1074,62 @@ function arrive(state) {
   state.phase = "location"; endRound(state);
 }
 
+// players at the same place are invited to the table before a location match starts (D-914 between people; D-1189): the online
+// game provides state.inviteHumans; a player who joins takes a seat as a caravan would. Solo games never wait here
+function withTable(state, start) {
+  if (!state.tableJoined && state.inviteHumans) {
+    const guests = state.inviteHumans(state);
+    if (guests.length) { state.table = { pending: guests.map((g) => g.human.seat), joined: [], start }; state.phase = "table-wait";
+      for (const g of guests) { g.meetMp = { kind: "h-invite", host: state.human.seat }; g.log.push({ round: g.round, text: `${state.human.name} starts a match here and asks whether you take a seat.`, kind: "event" }); }
+      note(state, `Other players are here: they're asked whether they take a seat (D-914).`); return; }
+  }
+  const joined = state.tableJoined || []; state.tableJoined = null; state.table = null;
+  state.tableNow = joined; try { return start(); } finally { state.tableNow = null; }
+}
+// entry points called from outside act() set this caravan's deck progression first (it lives in zsir's module state)
+export function tableReady(state) { const t = state.table; if (!t || t.pending.length) return; setRegionProgression(state);
+  state.tableJoined = t.joined; withTable(state, t.start); }
+const humanSeat = (st) => ({ kind: "human", st, deck: st.caravan.personal, name: st.human.name });
+function cpEvent(state, play) {
+  const ev = state.cpEvent, c = state.caravan; state.cpEvent = null;
+  if (!play) { note(state, "You let it be and go to the barrier."); state.phase = "checkpoint"; return; }
+  const back = () => { if (ev.kind === "carnival" && c.lastMatch === "win") { state.cpFree = true; note(state, "The Carnival's juggler bows out, laughing; the guard shrugs: you'll go through without an inspection (D-407).", "good"); }
+    else if (ev.kind === "carnival") note(state, "The Carnival wins this one; the inspection stands as usual.", "warn");
+    state.phase = "checkpoint"; };
+  if (ev.kind === "carnival") return startLocationMatch(state, ev.suits, c.at, back, E.poiDeckCard(state.rng, null, null, null, null, E.placeCtx(state.stops[c.at])), { opponents: ["Carnivalfolk", "King's Men"], noJoin: true, place: "the Carnival by the barrier" });
+  startLocationMatch(state, ev.suits, c.at, back, E.poiDeckCard(state.rng, null, null, null, null, E.placeCtx(state.stops[c.at])), { noJoin: true });
+}
+// the run starts at a POI (D-160; core-loop.md: start at a POI → a POI match, partner negotiated locally, D-150). The generator's
+// starting point carries no people of its own: read as the most common suits of the places its roads lead to (D-1201); the match
+// is optional as any (D-426). Not when a test asks for a plain start (opts.plainStart)
+// after a location match: the place's services, and the round ends; the opening match at the run's start is part of the start and
+// uses no round (D-1201)
+function backToRoad(state) { if (state.startMatch) { state.startMatch = false; state.phase = "declare"; return; } state.phase = "location"; endRound(state); }
+function openingPoi(state, opts) {
+  const st = state.stops[state.caravan.at]; if (opts.plainStart || !st || st.kind !== "start" || (state.board.region || 1) !== 1) return;
+  const n = {};
+  for (const l of state.legsFrom[st.id] || []) for (const su of state.stops[l.to].suits || []) n[su] = (n[su] || 0) + 1;
+  const suits = Object.keys(n).sort((a, b) => n[b] - n[a] || a.localeCompare(b)).slice(0, 4);
+  for (const su of SUITS) if (suits.length < 4 && !suits.includes(su)) suits.push(su);
+  state.startPoi = { id: st.id, kind: "poi", poi: null, name: "the starting point", suits };
+  state.phase = "match-offer";
+  note(state, `The run starts at a gathering place (D-160): locals of ${suits.join(", ")} are here, and a Zsír match is on offer, partner negotiated (optional).`, "event");
+}
+function excursion(state, go) {
+  const ex = state.excursion, here = state.stops[state.caravan.at];
+  if (state.world) (state.world.excursions ??= {})[`${here.id}:${state.round}`] = go;   // the first to arrive decides for all there (D-706 (2))
+  if (!go) { state.excursion = null; note(state, `You don't go. You stay in ${here.name}, but the visit is spent: no settlement actions this time (D-704).`, "warn"); state.phase = "declare"; endRound(state); return; }
+  state.hiddenFound.add(String(ex.cell));
+  note(state, `You go and look: ${ex.name} (discovered; only you know of it, D-706). Its people: ${ex.suits.join(", ")}.`, "good");
+  return withTable(state, () => startNegotiation(state, ex));   // the normal resource-site encounter, partnership mechanics included (D-705 (1))
+}
 function locationMatch(state, accept) {
-  if (!accept) { note(state, "Declined the match."); state.phase = "location"; endRound(state); return; }
-  const here = state.stops[state.caravan.at];
-  if (here.kind === "poi") return startNegotiation(state, here);   // POI partners are negotiated locally (D-150, D-872)
-  startLocationMatch(state, here.suits.slice(0, 4), here.id, null, E.poiDeckCard(state.rng, null, null, here.tier, here.beasts_roster));   // D-487 versions; rosters by tier (D-530, D-554)
+  const start = state.startPoi; state.startPoi = null; if (start && accept) state.startMatch = true;
+  if (!accept) { note(state, "Declined the match."); state.phase = start ? "declare" : "location"; if (!start) endRound(state); return; }
+  const here = start || state.stops[state.caravan.at];
+  if (here.kind === "poi") return withTable(state, () => startNegotiation(state, here));   // POI partners are negotiated locally (D-150, D-872)
+  const suits = state.offerSuits || here.suits.slice(0, 4); state.offerSuits = null;
+  withTable(state, () => startLocationMatch(state, suits, here.id, null, E.poiDeckCard(state.rng, null, null, here.tier, here.beasts_roster, E.placeCtx(here))));   // D-487 versions; rosters by tier (D-530, D-554)
 }
 
 // ---------------------------------------------------------------- POI partner negotiation (D-150, D-263, D-282, D-298, D-872)
@@ -925,7 +1141,10 @@ function startNegotiation(state, here) {
   const pool = N.offerPool(r, suits, cardValue);
   const cars = (state.joiners ? state.joiners(state) : []).slice(0, 3).map((ai, k) => { const shown = [...pool].sort(() => ai.ai.rng.next() - 0.5).slice(0, 4);
     return { id: 10 + k, kind: "caravan", ai, name: ai.ai.name[0].toUpperCase() + ai.ai.name.slice(1), shown, pick: ai.ai.rng.pick(shown) }; });
-  const npcs = [...cars, ...N.participants(r, suits, pool).slice(0, 3 - cars.length)];
+  // players who took a seat join the table with no terms of their own (a reading: they don't negotiate, D-1189); caravans after them
+  const ppl = (state.tableNow || []).map((st, k) => ({ id: 20 + k, kind: "human", st, name: st.human.name, shown: [], pick: pool.find((o) => o.id === "no-demands") || pool[pool.length - 1] }));
+  cars.splice(Math.max(0, 3 - ppl.length));
+  const npcs = [...ppl, ...cars, ...N.participants(r, suits, pool).slice(0, 3 - cars.length - ppl.length)];
   state.nego = { pool, npcs, shown: [...pool].sort(() => r.next() - 0.5).slice(0, 4), pick: null, suits };
   note(state, `Choosing a partner at ${here.name}: ${npcs.map((n) => n.kind === "caravan" ? n.name : `a ${n.suit} local`).join(", ")} take part. Pick one of your four offers; whoever picks the same deal partners you (D-263, D-298).`);
   state.phase = "negotiate";
@@ -950,25 +1169,27 @@ function negotiationAct(state, opts, action) {
     if (o.stage === "fallback") note(state, "No local picked your deal. Choose a partner from what they asked for.", "warn");
     return;
   }
-  if (action.type === "withdraw") { state.nego = null; note(state, "You walk away from the table: no match here this visit."); state.phase = "location"; endRound(state); return; }
+  if (action.type === "withdraw") { for (const x of n.npcs) if (x.kind === "human") x.st.meetMp = null;   // players who'd taken a seat go back to their road
+    state.nego = null; state.excursion = null; note(state, "You walk away from the table: no match here this visit."); backToRoad(state); return; }
   const a = opts.actions.find((x) => x.type === "partner" && x.id === action.id);
   if (!a || !a.allowed) throw new Error("not a partner you can take");
   formPartnership(state, a.npc, opts.stage);
 }
 function formPartnership(state, npc, how) {
-  const n = state.nego, here = state.stops[state.caravan.at], c = state.caravan, deal = npc.pick;
+  const n = state.nego, here = state.excursion || state.stops[state.caravan.at], c = state.caravan, deal = npc.pick;
+  state.excursion = null;                                  // back at the settlement after the encounter (D-704)
   const rest = n.npcs.filter((x) => x !== npc).sort((a, b) => (b.kind === "caravan") - (a.kind === "caravan"));   // caravans sit first
   note(state, `${npc.name} partners you${how === "matched" ? " (you picked the same deal)" : ""}. Terms: ${deal.text}`, "good");
   if (deal.id === "money-up-front") { c.coins -= deal.amount; if (npc.kind === "caravan") npc.ai.caravan.coins += deal.amount; note(state, `Paid your partner ${deal.amount} coins up front.`); }
   state.nego = null;
-  const deckCard = E.poiDeckCard(state.rng, here.poi, here.mine, null, here.beasts_roster);
-  if (n.npcs.some((x) => x.kind === "caravan")) {               // a table with other caravans: the shared-seat match (D-914)
-    const sv = (x) => (x.kind === "caravan" ? { kind: "caravan", ai: x.ai, deck: x.ai.caravan.personal, name: x.name } : { kind: "npc", suit: x.suit, name: x.name });
+  const deckCard = E.poiDeckCard(state.rng, here.hidden ? `hidden ${here.poi}` : here.poi, here.mine, null, here.beasts_roster, here.hidden ? { env: { hills: 1 }, kind: "poi", poi: here.poi, suits: here.suits } : E.placeCtx(here));   // a hidden site's richer odds (D-705, D-725)
+  if (n.npcs.some((x) => x.kind === "caravan" || x.kind === "human")) {   // a table with other caravans: the shared-seat match (D-914)
+    const sv = (x) => (x.kind === "human" ? humanSeat(x.st) : x.kind === "caravan" ? { kind: "caravan", ai: x.ai, deck: x.ai.caravan.personal, name: x.name } : { kind: "npc", suit: x.suit, name: x.name });
     const seats = [null, sv(rest[0]), sv(npc), sv(rest[1])];
     note(state, `At the table: ${seats[1].name} and ${seats[3].name} against you and ${seats[2].name}.`);
-    return startLocationMatch(state, n.suits, here.id, null, deckCard, { seats, deal, partnerAi: npc.kind === "caravan" ? npc.ai : null });
+    return startLocationMatch(state, n.suits, here.id, null, deckCard, { seats, deal, partnerAi: npc.kind === "caravan" ? npc.ai : null, place: here.hidden ? here.name : null });
   }
-  startLocationMatch(state, n.suits, here.id, null, deckCard, { partner: npc.suit, opponents: rest.map((x) => x.suit), deal, partnerName: npc.name });
+  startLocationMatch(state, n.suits, here.id, null, deckCard, { partner: npc.suit, opponents: rest.map((x) => x.suit), deal, partnerName: npc.name, place: here.hidden ? here.name : null });
 }
 // after the match: card deals only if the named card was captured (D-263); profit sharing in coins (D-872); originals
 // never divided (D-271): the player's captured cards leave only by the deal's own terms
@@ -988,32 +1209,52 @@ function settleDeal(state, deal, got, partnerAi = null) {
     const u = c.cargo.filter((y) => y.refined || y.adjective).sort((a, b) => cardValue(a) - cardValue(b))[0];
     if (u) { take(u); if (pc) { pc.cargo.push(u); trimCargo(pc); } const g = N.valuableGift(r, suits); c.cargo.push(g); note(state, `Deal: you give ${cardName(u)} and receive ${cardName(g)}.`, "good"); }
     else note(state, "Deal: you have no upgraded card to give, so nothing changes hands.");
+  } else if (deal.id === "greedy") {                     // D-179: the greedy ally takes your share; you forfeit the captures (D-1183)
+    const all = got.slice(); for (const x of all) take(x);
+    if (pc) { pc.cargo.push(...all); trimCargo(pc); }
+    note(state, all.length ? `Deal: your greedy partner takes your share: ${all.map(cardName).join(", ")}.` : "Deal: your team captured nothing, so the greedy partner takes nothing of yours.", all.length ? "warn" : "info");
   } else if (deal.id === "profit-share") {
     const due = Math.min(c.coins, Math.ceil(deal.share * got.reduce((a, y) => a + cardValue(y), 0)));
     c.coins -= due; if (pc) pc.coins += due; note(state, `Deal: you pay your partner ${due} coins, their share of the captured value.`, due ? "warn" : "info");
   }
 }
 
+/** a local card recruited at a settlement: its version follows the place's own deck (D-487, D-579: the context decides): rural
+ *  Tradesfolk / Townsfolk by tier, agricultural Beasts by the map, the Parchmenter where Clergy meets Forestfolk (D-1215) */
+function localVersion(state, here, rank, suit) {
+  const suits = here.suits || [];
+  if (rank === "Alsó" && suit === "Clergy" && suits.includes("Clergy") && suits.includes("Forestfolk") && state.rng.next() < PLACEHOLDER.parchmenterChance) return { rank, suit, roster: "alternative", name: "Parchmenter" };
+  const v = E.poiDeckCard(state.rng, null, null, here.tier, here.beasts_roster, E.placeCtx(here))(rank, suit);
+  return { rank, suit, ...Object.fromEntries(Object.entries(v || {}).filter(([, x]) => x !== undefined)) };
+}
 function startLocationMatch(state, suits, at, after, deckCard, team = {}) {
   // other caravans here join the match and take seats; NPC locals fill the rest (D-408, D-425): with one caravan it sits opposite
   // you, each of you partnered by a local; with two or three, partners are drawn at random (D-914)
-  const joiners = !team.partner && !team.seats && state.joiners ? state.joiners(state) : [];
+  const ppl = !team.partner && !team.seats ? (state.tableNow || []).map(humanSeat) : [];
+  const joiners = !team.partner && !team.seats && !team.noJoin && state.joiners ? state.joiners(state, !!state.forceJoin).slice(0, 3 - ppl.length) : [];
   let seats = team.seats || null;
-  if (!seats && joiners.length) {
+  if (!seats && joiners.length + ppl.length) {
     const r = state.rng, local = () => { const su = r.pick(suits); return { kind: "npc", suit: su, name: `${su} local` }; };
-    const cars = joiners.map((ai) => ({ kind: "caravan", ai, deck: ai.caravan.personal, name: ai.ai.name[0].toUpperCase() + ai.ai.name.slice(1) }));
+    const cars = [...ppl, ...joiners.map((ai) => ({ kind: "caravan", ai, deck: ai.caravan.personal, name: ai.ai.name[0].toUpperCase() + ai.ai.name.slice(1) }))];
     const others = [...cars, ...Array.from({ length: 3 - cars.length }, local)];
     if (cars.length === 1) seats = [null, cars[0], others[1], others[2]];
     else { const k = Math.floor(r.next() * others.length), partner = others.splice(k, 1)[0]; seats = [null, others[0], partner, others[1]]; }
-    note(state, `Sharing the table: ${seats.slice(1).map((x) => x.name).join(", ")}${seats[2].kind === "caravan" ? ` (${seats[2].name} is your partner)` : ""} (D-914).`);
+    note(state, `Sharing the table: ${seats.slice(1).map((x) => x.name).join(", ")}${seats[2].kind !== "npc" ? ` (${seats[2].name} is your partner)` : ""} (D-914).`);
   }
   const dep = !team.partner && !seats && state.stops[at]?.kind !== "poi" ? deployed(state.caravan) : { personal: state.caravan.personal, companion: null };
-  const m = zsirLocationMatch({ rng: state.rng, suits, playerPersonal: dep.personal, deckCard, partner: team.partner, opponents: team.opponents, wanted: state.requirement?.test, seats, companion: dep.companion,
+  // the Parchmenter (alternative Clergy Alsó): placement intent "Clergy-involved decks near forests" (D-568), read as a deck with
+  // both Clergy and Forestfolk; chance PLACEHOLDER (D-1192)
+  if (suits.includes("Clergy") && suits.includes("Forestfolk") && state.rng.next() < PLACEHOLDER.parchmenterChance) {
+    const base = deckCard; deckCard = (rank, suit) => (rank === "Alsó" && suit === "Clergy" ? { roster: "alternative", name: "Parchmenter" } : base ? base(rank, suit) : {}); }
+  const m = zsirLocationMatch({ rng: state.rng, suits, playerPersonal: dep.personal, deckCard, extra: state.glitch?.has(at) ? [glitched()] : [], partner: team.partner, opponents: team.opponents, wanted: state.requirement?.test, seats, companion: dep.companion,
                                 names: team.partner ? ["You", `${team.opponents[0]} local`, team.partnerName, `${team.opponents[1]} local`] : undefined,
                                 value: cardValue, trickLimit: PLACEHOLDER.trickLimit, onPlay: onPlay(state.rng), onTrick: onTrick(state.rng, state.caravan.personal, state.caravan.cargo) });
-  m.richer = wealthTest(state, seats ? [state, ...seats.slice(1).map((x) => (x.kind === "caravan" ? x.ai : null))] : [state, null, team.partner ? null : state, null]);
+  m.richer = wealthTest(state, seats ? [state, ...seats.slice(1).map((x) => (x.kind === "caravan" ? x.ai : x.kind === "human" ? x.st : null))] : [state, null, team.partner ? null : state, null]);
   if (dep.companion) { m.mercHalf = dep.companion.half; m.mercSeat2 = true; }
-  state.match = { m, at, kind: "location", after, deal: team.deal, partnerAi: team.partnerAi || null };
+  state.match = { m, at, kind: "location", after, deal: team.deal, partnerAi: team.partnerAi || null, place: team.place || null };
+  // players at the table play their own seats (D-1189)
+  if (seats && seats.some((x) => x?.kind === "human")) { m.humanSeats = [0, ...seats.map((x, k) => (x?.kind === "human" ? k : -1)).filter((k) => k > 0)];
+    seats.forEach((x, k) => { if (x?.kind === "human") x.st.meetMp = { kind: "h-table", m, me: k, host: state.human?.seat }; }); }
   state.phase = "match";
 }
 
@@ -1024,22 +1265,39 @@ function finishMatch(state) {
   const { m } = state.match, c = state.caravan;
   mercShare(state, m);
   // a shared match (D-914): you keep what your own seat captured; each caravan what its seat did; a local's captures stay here
-  const mine = m.shared ? m.capturedBySeat[0] : m.captured[0];
+  // human partners each get a copy of their team's captures (D-179, D-232); otherwise each seat keeps its own (D-914)
+  const humanAt = (k) => k === 0 || m.shared?.[k]?.kind === "human";
+  const seatCaps = (k) => (humanAt(k) && humanAt((k + 2) % 4) ? [...m.capturedBySeat[k], ...m.capturedBySeat[(k + 2) % 4].map(plain)] : m.capturedBySeat[k]);
+  const mine = m.shared ? seatCaps(0) : m.captured[0];
+  if (m.shared) m.shared.forEach((sv, k) => { if (sv?.kind !== "human") return;   // a player at the table: their seat's captures, their partner's result
+    const g = sv.st, gc = g.caravan, won = seatCaps(k).map(plain), myTeam = k % 2 === 0;
+    for (const x of won.filter(isCorr)) { won.splice(won.indexOf(x), 1); gc.personal.push(x); }
+    gc.cargo.push(...won); gc.lastMatch = m.result === "draw" ? "draw" : (m.result === "win") === myTeam ? "win" : "lose";
+    g.meetMp = null; g.log.push({ round: g.round, text: `The match at ${state.stops[state.match.at].name} is over: ${won.length ? `you take ${won.map(cardName).join(", ")}` : "you took nothing"}.`, kind: "good" });
+    if (slots(gc) > capacity(gc)) { gc.capacity = capacity(gc); g.phase = "overflow"; g.afterOverflow = () => { g.phase = "declare"; }; g.log.push({ round: g.round, text: "The wagon is over capacity: choose what to leave behind (D-265).", kind: "warn" }); } });
   if (m.shared) m.shared.forEach((sv, k) => { if (!sv || sv.kind !== "caravan") return;
     const ac = sv.ai.caravan, won = m.capturedBySeat[k].map(plain), myTeam = k % 2 === 0;
+    for (const x of won.filter(isCorr)) { won.splice(won.indexOf(x), 1); ac.personal.push(x); state.glitch?.delete(state.match.at); }
     ac.cargo.push(...won, ...(k === 2 && m.sideGains ? m.sideGains.generated : [])); if (k === 2 && m.sideGains) ac.coins += m.sideGains.coins;
+    if (m.seatCoins?.[k]) ac.coins += m.seatCoins[k];        // Collection Plate won by this caravan's seat (D-1174)
     trimCargo(ac);                                         // its overflow (D-265)
     ac.lastMatch = m.result === "draw" ? "draw" : (m.result === "win") === myTeam ? "win" : "lose"; });
-  const got = mine.map((x) => qualityRoll(state, plain(x)));   // D-662: exact copy or base (encounter decks, not D-824 (1) pools)
+  const got = mine.map((x) => (isCorr(x) ? plain(x) : qualityRoll(state, plain(x))));   // D-662: exact copy or base (encounter decks, not D-824 (1) pools)
+  // a glitched card captured goes to the personal deck, and the place stops glitching (D-751)
+  for (const x of got.filter(isCorr)) { got.splice(got.indexOf(x), 1); c.personal.push(x); state.glitch?.delete(state.match.at); note(state, "You captured the glitched card: corrupted data, now in your personal deck (D-751).", "event"); }
   c.cargo.push(...got, ...m.generated); c.lastMatch = m.result;         // generated cards wait for this step (D-736)
+  // cards refined during the match (Stalking) trigger their "whenever refined" effects now, when they're yours (Hidden Extras,
+  // Refinement Jackpot, Second Harvest...; D-317, D-656; D-1204)
+  for (const x of m.refinedInMatch || []) { const mine = [...c.cargo, ...c.personal].find((y) => y === x) || got.find((y) => y.name === x.name && y.suit === x.suit && y.rank === x.rank && y.refined === x.refined);
+    if (mine) afterRefine(state, mine); }
   if (m.coins) { c.coins += m.coins; note(state, `Collection Plate earned you ${m.coins} coin${m.coins === 1 ? "" : "s"} in the match.`, "good"); }
-  note(state, `Zsír at ${state.stops[state.match.at].name}: ${m.result === "win" ? "won" : m.result === "lose" ? "lost" : "drawn"} `
+  note(state, `Zsír at ${state.match.place || state.stops[state.match.at].name}: ${m.result === "win" ? "won" : m.result === "lose" ? "lost" : "drawn"} `
     + `(${m.captured[0].filter((x) => x.rank === "X" || x.rank === "Ász").length * 10}–${m.captured[1].filter((x) => x.rank === "X" || x.rank === "Ász").length * 10}). `
     + (got.length ? `Captured ${got.length}: ${got.map(cardName).join(", ")}.` : "Nothing captured.")
     + (m.generated.length ? ` Travelling Merchant brought ${m.generated.map((x) => `${x.suit} VIII (Refinement I)`).join(", ")}.` : ""), m.result === "lose" ? "warn" : "good");
   const after = state.match.after, deal = state.match.deal, partnerAi = state.match.partnerAi; state.match = null;
   if (deal) settleDeal(state, deal, got, partnerAi);                     // before recruitment, so a sold card can't be recruited
-  postMatch(state, got, after || (() => { state.phase = "location"; endRound(state); }));
+  postMatch(state, got, after || (() => backToRoad(state)));
 }
 
 // ---------------------------------------------------------------- after a match (D-732 steps 5, 6, 8)
@@ -1087,13 +1345,23 @@ function upgrade(state, opts, action) {
 
 // ================================================================ road encounters (D-678 B4; encounters.js)
 const growl = (state, text) => note(state, text, "growl");      // the Growl convention: minor news, no screen (D-798)
-const roadDone = (state) => { state.event = null; state.phase = "declare"; endRound(state); };
+const roadDone = (state) => { const next = state.afterRoad; state.afterRoad = null; state.event = null; if (next) return next(); state.phase = "declare"; endRound(state); };
 
 function localSuits(state, here) {
   // "suits of the surrounding area": approximated by the suits of the stops on either side of this encounter point
   const near = new Set();
   for (const l of state.legsFrom[here.id] || []) for (const x of state.stops[l.to].suits || []) near.add(x);
   for (const l of state.board.legs) if (l.to === here.id) for (const x of state.stops[l.from].suits || []) near.add(x);
+  // travelling suits from elsewhere (D-750): now and then the road brings people who don't live here: Plainsfolk drovers off the
+  // plains (where the region has Plainsfolk), performers between two towns (Carnivalfolk), officials near a checkpoint or Castle
+  // Town (King's Men); one at most per encounter; chance PLACEHOLDER (D-1199)
+  const ends = [...(state.legsFrom[here.id] || []).map((l) => state.stops[l.to]), ...state.board.legs.filter((l) => l.to === here.id).map((l) => state.stops[l.from])];
+  const cand = [];
+  if (state.board.stops.some((x) => (x.suits || []).includes("Plainsfolk"))) cand.push(["Plainsfolk", "drovers off the plains"]);
+  if (ends.filter((x) => x.kind === "settlement").length >= 2) cand.push(["Carnivalfolk", "performers between towns"]);
+  if (ends.some((x) => x.kind === "checkpoint" || x.castleTown)) cand.push(["King's Men", "officials on the road to the checkpoint"]);
+  const fresh = cand.filter(([su]) => !near.has(su));
+  if (near.size && fresh.length && state.rng.next() < PLACEHOLDER.travellingSuit) { const [su, who] = state.rng.pick(fresh); near.add(su); note(state, `On the road: ${who} (${su}) are passing through.`); }
   return near.size ? [...near] : SUITS;
 }
 function parallelStops(state, here) {
@@ -1158,8 +1426,13 @@ function roadEncounter(state, here) {
       const kind = r.weighted(Object.entries(P.treasureWeights), ([, w]) => w)[0];
       if (kind === "coins") { const n = P.treasureCoinsPerStop * here.stop; c.coins += n; growl(state, `Found treasure: ${n} coins.`); }
       else {
-        const card = kind === "commodity" ? E.baseCommodity(r, local) : { rank: r.pick(RANKS_), suit: r.pick(ALL_SUITS_), refined: 1 };   // an already upgraded card, any suit (D-804)
-        c.cargo.push(card); growl(state, `Found treasure: ${cardName(card)}.`);
+        // value scales with the stop number for every category (D-804 (12); D-1225): more goods, or a further refined card, at later
+        // stops (rates PLACEHOLDER)
+        const cards = [];
+        if (kind === "commodity") for (let k = 0; k < 1 + Math.floor(here.stop / P.treasureStopsPerGood); k++) cards.push(E.baseCommodity(r, local));
+        else { const g = { rank: r.pick(RANKS_), suit: r.pick(ALL_SUITS_), refined: 1 }, e = upgradeEntry(g);   // an already upgraded card, any suit (D-804)
+          if (e) g.refined = Math.min(e.stages.length - 1, 1 + Math.floor(here.stop / P.treasureStopsPerStage)); cards.push(g); }
+        c.cargo.push(...cards); growl(state, `Found treasure: ${cards.map(cardName).join(", ")}.`);
         return afterIncoming(state, () => roadDone(state));          // a full wagon: the normal overflow selection (D-871 (2))
       }
       return roadDone(state);
@@ -1183,7 +1456,7 @@ function roadEncounter(state, here) {
         state.event.stock = Array.from({ length: P.innStock }, () => E.cardFromStage(r.pick(opts))); }
       break;
     case "King's Men patrol":
-      state.event.mode = roadMilitary(c) > 2 ? "help" : roadMilitary(c) >= 2 ? "trade" : "inspect";   // D-803 (b) average 2: trade; (c) above 2: help
+      state.event.mode = roadMilitaryAt(state) > 2 ? "help" : roadMilitaryAt(state) >= 2 ? "trade" : "inspect";   // D-803 (b) average 2: trade; (c) above 2: help
       // (a) below 2: a routine cargo inspection, then a warning about bandits nearby; the minor checkpoint's rule (D-923, D-808): a 2-card
       // spot check, any X or Ász found → surrender them (a second check follows) or fight (a cargo ambush against King's Men)
       if (state.event.mode === "inspect") { note(state, "A King's Men patrol stops you for a routine look at your cargo (D-803).", "warn"); return minorCheck(state, 2, 1); }
@@ -1194,7 +1467,7 @@ function roadEncounter(state, here) {
       break;
     case "Bandits ambush": case "Beasts ambush": return startAmbush(state, ev, false);
     case "deserters": {                                         // D-801 (9): strictly stronger caravan -> 50 % they flee
-      if (roadMilitary(c) > P.hostileMilitary["King's Men"] && r.next() < luck(state, 0.5)) {
+      if (roadMilitaryAt(state) > enemyMilitary(state, "King's Men") && r.next() < luck(state, 0.5)) {
         const left = r.pick(E.hostilePool(r, "deserters", local)); c.cargo.push(left);
         note(state, `Deserters! Seeing your escort, they flee, leaving ${cardName(left)} behind.`, "good");
         return afterIncoming(state, () => roadDone(state));
@@ -1214,7 +1487,7 @@ function roadEncounter(state, here) {
       if (!cands.length) { note(state, `A travelling ${suit} craftsman offers a free refinement, but none of your ${suit} cards is one he can work on.`); return roadDone(state); }
       break;
     }
-    case "dubious toll collectors": state.event.backOff = roadMilitary(c) > P.hostileMilitary["King's Men"]; break;
+    case "dubious toll collectors": state.event.backOff = roadMilitaryAt(state) > enemyMilitary(state, "King's Men"); break;
     default: break;   // broken-down caravan, abandoned wagon: choices in eventOptions
   }
   state.phase = "event";
@@ -1225,8 +1498,12 @@ function eventOptions(state) {
   const c = state.caravan, ev = state.event, here = state.stops[c.at], P = PLACEHOLDER.enc;
   const acts = ev.name === "dubious toll collectors" && !ev.backOff ? [] : [{ type: "leave" }];   // D-809: pay, search, or fight
   const free = slots(c) < c.capacity;
-  const buy = (stock, mult = 1) => stock.forEach((card, i) => { const price = Math.ceil(cardValue(card) * buyMult(ev.local, card) * mult * (1 - peddlerDiscount(card)) * INFL); acts.push({ type: "buy", i, card, price, allowed: c.coins >= price && free }); });
-  const sell = (test, mult = 1) => c.cargo.forEach((card, i) => { if (test(card)) acts.push({ type: "sell", i, card, bundle: mates(c, card).length, price: priceOf(c, card, (x) => Math.max(1, Math.ceil(cardValue(x) * sellMult(ev.local, x) * mult * INFL))), endsRun: counted(c) - countedOut(mates(c, card)) < RULES.cargoMinimum }); });
+  // the peddler's and the inn's prices go through the ordinary trade rules, so every trading ability applies there too (Trading
+  // Advantage, Merchant's Cut, Premium Sale, Wandering, Luxury Trade, Market Privileges, Discount...; D-1204): a stall with the
+  // place's people, no tier and no demand, at its own markup
+  const pm = { suits: ev.local, tier: null, demand: {} };
+  const buy = (stock, mult = 1) => stock.forEach((card, i) => { const price = Math.ceil(buyPrice(pm, card) * mult); acts.push({ type: "buy", i, card, price, allowed: c.coins >= price && free }); });
+  const sell = (test, mult = 1) => c.cargo.forEach((card, i) => { if (test(card)) acts.push({ type: "sell", i, card, bundle: mates(c, card).length, price: priceOf(c, card, (x) => Math.max(1, Math.ceil(sellPrice(pm, x) * mult))), endsRun: counted(c) - countedOut(mates(c, card)) < RULES.cargoMinimum }); });
   switch (ev.name) {
     case "travelling peddler": buy(ev.stock); sell(E.isCommodity); break;
     case "travelling mercenaries": {
@@ -1244,14 +1521,16 @@ function eventOptions(state) {
     case "abandoned wagon": acts.push({ type: "search" }); break;
     case "pilgrims": case "festival": acts.push({ type: "friendly" }); break;     // optional friendly short match (D-795)
     case "travelling craftsman": ev.cands.forEach((x, i) => acts.push({ type: "craft", i, card: x.card, to: x.offer.to })); break;
-    case "minor checkpoint": acts.length = 0; acts.push({ type: "mc-fight" }, { type: "mc-surrender" }); break;
+    // a discovery offers Fight / Surrender, and the Bribe with a qualifying ability, as at a checkpoint (D-737, D-806 (15), D-808; D-1223)
+    case "minor checkpoint": acts.length = 0; acts.push({ type: "mc-fight" }, { type: "mc-surrender" }, ...minorBribes(state, ev)); break;
     case "King's Men patrol":
-      if (ev.mode === "inspect") { acts.length = 0; acts.push({ type: "mc-fight" }, { type: "mc-surrender" }); break; }
+      if (ev.mode === "inspect") { acts.length = 0; acts.push({ type: "mc-fight" }, { type: "mc-surrender" }, ...minorBribes(state, ev)); break; }
       if (ev.mode === "trade") buy(ev.stock); else acts.push({ type: "help" });
       break;
     case "dubious toll collectors":
       if (ev.backOff) acts.push({ type: "confront" });
-      else acts.push({ type: "pay-toll", amount: P.tollAmount, allowed: c.coins >= P.tollAmount }, { type: "spot-check" }, { type: "refuse" });
+      else { const toll = discounted(c, P.tollAmount);   // a road charge: Special Treatment and the other road-charge cuts apply (D-1210)
+        acts.push({ type: "pay-toll", amount: toll, allowed: c.coins >= toll }, { type: "spot-check" }, { type: "refuse" }); }
       break;
   }
   acts.push(...profiteerShop(state, "road"));
@@ -1272,7 +1551,7 @@ function eventAct(state, opts, action) {
     case "buy": c.coins -= a.price; c.cargo.push(ev.stock.splice(a.i, 1)[0]); note(state, `Bought ${cardName(a.card)} for ${a.price} coins.`); return;
     case "sell": removeCargo(c, c.cargo[a.i]); c.coins += a.price + bundling(state, a.card, a.price); note(state, `Sold ${cardName(a.card)} for ${a.price} coins.`); lostRun(state); return;
     case "help": note(state, "You join the patrol against the bandits nearby: a standard Zsír encounter (D-803).");
-      return startLocationMatch(state, ["King's Men", "Bandits", ...ev.local.filter((x) => x !== "King's Men" && x !== "Bandits").slice(0, 2)], c.at, () => roadDone(state), E.poiDeckCard(state.rng, null, null));
+      return startLocationMatch(state, ["King's Men", "Bandits", ...ev.local.filter((x) => x !== "King's Men" && x !== "Bandits").slice(0, 2)], c.at, () => roadDone(state), E.poiDeckCard(state.rng, null, null, null, null, E.placeCtx(state.stops[c.at])));
     case "take-passenger": c.passenger = true; note(state, "A lost traveller rides with you to the next settlement; they take one wagon slot (D-421)."); return roadDone(state);
     case "give-money": {                                         // D-797: money returns a random upgraded card, any rank and suit
       c.coins -= a.amount; const got = { rank: r.pick(RANKS_), suit: r.pick(ALL_SUITS_), refined: 1 };
@@ -1291,12 +1570,18 @@ function eventAct(state, opts, action) {
       note(state, `The ${ev.suit} craftsman refines ${before} into ${cardName(card)}, free of charge.`, "good"); return roadDone(state);
     }
     case "mc-fight": note(state, ev.name === "King's Men patrol" ? "You fight the patrol (D-923: the minor checkpoint's rule)." : "You fight the minor checkpoint's guards (D-808).", "warn"); return startAmbush(state, "minor checkpoint", false);
+    case "mc-bribe": {
+      if (r.next() < Math.min(1, luck(state, a.chance))) { c.coins -= a.amount; note(state, `The guard pockets ${a.amount} coins and looks away (bribe accepted, D-136).`, "good");
+        return roadDone(state); }
+      note(state, `The guard refuses your ${a.amount} coins (${Math.round(a.chance * 100)}% chance) and calls the others (D-136).`, "bad");
+      return startAmbush(state, "minor checkpoint", false);
+    }
     case "mc-surrender": {
-      const { n } = ev.inspection, found = fieldMedicine(state, ev.inspection.found);
+      const { n } = ev.inspection, found = returnFromConfiscation(state, fieldMedicine(state, ev.inspection.found));
       for (const d of found) { const deck = d.from === "cargo" ? c.cargo : c.personal; deck.splice(deck.indexOf(d.card), 1); }
       if (found.length) note(state, `Surrendered ${found.map((d) => cardName(d.card)).join(", ")}.`, "warn"); c.capacity = capacity(c);
       if (lostRun(state)) return;
-      if (n === 1) return minorCheck(state, r.pick(PLACEHOLDER.secondInspectionSizes), 2);   // a second draw (D-137)
+      if (n === 1) return minorCheck(state, secondSize(state), 2);   // a second draw (D-137)
       return roadDone(state);
     }
     case "friendly": {                                           // D-795, D-881: personal decks, 2 tricks, Zsír points
@@ -1316,10 +1601,8 @@ function eventAct(state, opts, action) {
       }
     case "pay-toll": c.coins -= a.amount; note(state, `Paid the toll collectors ${a.amount} coins.`); return roadDone(state);
     case "spot-check": {                                         // D-808, D-809: 2 cards; contraband -> cargo ambush
-      const pool = [...c.cargo, ...c.personal], drawn = [];
-      for (let k = 0; k < 2 && pool.length; k++) drawn.push(pool.splice(Math.floor(r.next() * pool.length), 1)[0]);
-      const found = drawn.filter((x) => x.rank === "X" || x.rank === "Ász");
-      note(state, `Spot check: ${drawn.map(cardName).join(", ")}.${found.length ? " Contraband!" : " Nothing found; they let you pass."}`, found.length ? "bad" : "good");
+      const { drawn, found } = spotDraw(state, 2);
+      note(state, `Spot check: ${drawn.map((d) => cardName(d.card)).join(", ")}.${found.length ? " Contraband!" : " Nothing found; they let you pass."}`, found.length ? "bad" : "good");
       if (found.length) return startAmbush(state, "dubious toll collectors", false);
       return roadDone(state);
     }
@@ -1335,6 +1618,7 @@ function finishFriendly(state) {
   const { m, event } = state.match, c = state.caravan, r = state.rng, a = zscore(m, 0), b = zscore(m, 1); c.lastMatch = m.result;
   note(state, `Friendly match ${m.result === "win" ? "won" : m.result === "lose" ? "lost" : "drawn"} (${a.points}–${b.points}${a.points === b.points ? `, value ${a.value}–${b.value}` : ""}).`, m.result === "win" ? "good" : "info");
   state.match = null;
+  if (m.coins) { c.coins += m.coins; note(state, `Your cards' abilities earned ${m.coins} coin${m.coins === 1 ? "" : "s"} in the match.`, "good"); }   // as in any match (D-1204)
   if (m.result !== "win") return roadDone(state);
   let prize;
   if (event === "pilgrims") {
@@ -1343,18 +1627,46 @@ function finishFriendly(state) {
     prize = st.length ? E.cardFromStage(r.pick(st)) : { rank, suit: "Clergy", refined: 1 };
   } else prize = E.cardFromStage(r.pick(E.stagesOf((s) => s.rank === "X" && s.stage === 0)));   // a random commodity X, base (D-805)
   c.cargo.push(prize); note(state, `Your prize: ${cardName(prize)}.`, "good");
-  afterIncoming(state, () => roadDone(state));
+  afterIncoming(state, () => roadDone(state), true);   // a Zsír game: Scavenging follows an overflow (D-493; D-1217)
 }
 
 // the minor checkpoint's spot check, under the checkpoint inspection rules (D-134, D-136, D-737: no Bribe without an ability)
-function minorCheck(state, size, n) {
+/** a King's Men caravan's cargo inspection after you refuse its challenge (D-412): the minor checkpoint's rule (D-806 (15), D-808);
+ *  afterwards your round goes on where it was (D-1185) */
+export function meetingInspection(state) {
+  setRegionProgression(state);
+  const c = state.caravan;
+  state.event = { name: "minor checkpoint", local: state.stops[c.at].suits || SUITS }; state.afterRoad = () => { state.phase = "declare"; };
+  if (slots(c) >= 33) { note(state, `Your wagon is packed (${slots(c)} slots): they can't be bothered.`, "good"); return roadDone(state); }
+  return minorCheck(state, 2, 1);
+}
+// the inspection Bribe at a minor-check-style discovery: the checkpoint's own offers, sized by this check (D-136, D-737; D-1223)
+// a hostile force's military in a road strength check: Elven Paratroopers lower it "before the check" (D-752, D-1190; D-1226)
+function enemyMilitary(state, faction) {
+  const para = state.caravan.personal.some((x) => isCorr(x, "paratroopers")) ? PLACEHOLDER.corruption.paratroopers : 0;
+  return Math.max(0, PLACEHOLDER.enc.hostileMilitary[faction] - para);
+}
+function minorBribes(state, ev) {
+  if (!ev.inspection) return [];
+  return inspectionBribes(state, { size: ev.inspection.size || 2 }).map((b, i) => ({ ...b, type: "mc-bribe", i }));
+}
+// a roadside spot check's draw: the same inspection mechanics as a checkpoint's (D-456): Sweet Talk redraws one find (D-362, D-365;
+// D-1204); used by the minor checks and the toll collectors' search (D-808 (1); D-1224)
+function spotDraw(state, size) {
   const c = state.caravan, pool = [...c.cargo.map((card) => ({ card, from: "cargo" })), ...c.personal.map((card) => ({ card, from: "personal" }))], drawn = [];
   for (let k = 0; k < size && pool.length; k++) drawn.push(pool.splice(Math.floor(state.rng.next() * pool.length), 1)[0]);
-  const found = drawn.filter((d) => d.card.rank === "X" || d.card.rank === "Ász");
+  if (c.personal.some(MERC.sweetTalk)) {
+    const hits = drawn.filter((d) => d.card.rank === "X" || d.card.rank === "Ász"), others = c.cargo.filter((x) => !drawn.some((d) => d.card === x));
+    if (hits.length && others.length) { const h = state.rng.pick(hits); drawn[drawn.indexOf(h)] = { card: state.rng.pick(others), from: "cargo" }; note(state, "Sweet Talk: the Impresario talks the guard into looking at something else.", "good"); }
+  }
+  return { drawn, found: drawn.filter((d) => d.card.rank === "X" || d.card.rank === "Ász") };
+}
+function minorCheck(state, size, n) {
+  const { drawn, found } = spotDraw(state, size);
   const who = state.event?.name === "King's Men patrol" ? "Patrol" : "Minor checkpoint";
   note(state, `${who}, ${n === 1 ? "spot check" : "second check"} (${size} cards): ${drawn.map((d) => cardName(d.card)).join(", ")}.${found.length ? " Contraband!" : " Nothing found; on you go."}`, found.length ? "bad" : "good");
   if (!found.length) { if (who === "Patrol") note(state, "Before they ride off, the patrol warns you: bandits about in these parts (D-803)."); return roadDone(state); }
-  state.event.inspection = { found, n }; state.phase = "event";
+  state.event.inspection = { found, n, size }; state.phase = "event";
 }
 // what a travelling craftsman can do for a card: its next refinement stage, if the build supports it (D-882)
 function craftOffer(card) {
@@ -1373,6 +1685,7 @@ const FACTION = { "Bandits ambush": "Bandits", "Beasts ambush": "Beasts", "dubio
 // a caravan as the other side (D-184, D-202 escalation, D-222): its own cargo is the pool, its military counts, its owner and companion
 // play from its personal deck; afterwards the round goes on where it was (the meeting comes after the stop's event, D-731)
 export function startCaravanAmbush(state, rival, playerAmbushes) {
+  setRegionProgression(state);                             // called from meetings, outside act()
   state.ambushRival = rival; state.event = { local: state.stops[state.caravan.at].suits || SUITS };
   return startAmbush(state, rival.ai.name, playerAmbushes, rival);
 }
@@ -1400,10 +1713,20 @@ function startAmbush(state, kind, playerAmbushes, rival = null) {
   const shepherd = faction === "Beasts" ? c.personal.filter(RURAL_T.proud).length * PLACEHOLDER.beastDefence : 0;
   // Local Support (Fisherman's Papers, personal deck): +1 military at stops where Fisherfolk live
   const fishHere = (state.event?.local || state.stops[c.at]?.suits || []).includes("Fisherfolk");
-  const support = (fishHere && c.personal.some(FISH.papers) ? 1 : 0)
+  const support = (fishHere ? two(c.personal.filter(FISH.papers)).length : 0)
     // the Lurker (mercenary #1, from Lurker): +1 military in encounters at stops where Forestfolk live; not checkpoints (D-372)
     + ((state.event?.local || state.stops[c.at]?.suits || []).includes("Forestfolk") && c.personal.some(MERC.lurker) ? 1 : 0);
-  const milO = rival ? military(rival.caravan) : PLACEHOLDER.enc.hostileMilitary[faction], milP = Math.max(0, military(c) + law + formation + untrained + shepherd + support);
+  // Elven Paratroopers (Corruption, personal deck): the opposing military is lowered before the check; PLACEHOLDER amount, once per
+  // encounter, copies don't stack (D-752; D-1190)
+  const para = c.personal.some((x) => isCorr(x, "paratroopers")) ? PLACEHOLDER.corruption.paratroopers : 0;
+  if (para) note(state, `Elven Paratroopers drop behind their lines: their military −${para}.`, "good");
+  // a rival caravan's own road bonuses count when it attacks or defends (Marching Formation; Establishing the Law against Bandits;
+  // Familiar Roads against Bandits or Beasts; D-1204)
+  const myCiv = state.civ || state.ai?.civ, rc = rival?.caravan;
+  const rivalMil = rival ? militaryRaw(rc) + (roadMilitary(rc) - military(rc))
+    + (myCiv === "Bandits" ? Math.min(2, rc.personal.filter(PLAINS.pusztabiro).length) : 0)
+    + (myCiv === "Bandits" || myCiv === "Beasts" ? 0.5 * [...rc.cargo, ...rc.personal].filter(RURAL.local).length : 0) : 0;
+  const milO = Math.max(0, (rival ? Math.ceil(rivalMil) : PLACEHOLDER.enc.hostileMilitary[faction]) - para), milP = Math.max(0, Math.ceil(militaryRaw(c) + law + formation + untrained + shepherd + support));   // rounded once (D-183)
   let [needP, needO] = E.exposure(c.cargo.length, milP, pool.length, milO);
   if (formation) note(state, `Marching Formation: +${formation} military on the road.`, "good");
   // Run Them Down! (Charger 10 %, Nightmare 25 %, personal deck): negates the EXTRA exposure from military inferiority; the
@@ -1467,8 +1790,9 @@ function launchAmbush(state) {
   while (deck.length < 16) deck.push(zcard(r.pick(["VII", "VIII", "IX", "Alsó", "Felső", "Király"]), r.pick(a.local), { own: "gen" }));   // D-227, D-253
   const dep = deployed(state.caravan);
   const m = ambushMatch({ rng: r, deck, playerPersonal: dep.personal, faction: a.faction, value: cutValue, wanted: state.requirement?.test, companion: dep.companion,
-                          ...(a.rival ? { opponentPersonal: a.rival.caravan.personal, names: ["You", a.rival.ai.name, "Companion", `${a.rival.ai.civ} companion`] } : {}),
-                          trickLimit: E.ambushTrickLimit(combined), onPlay: onPlay(r), onTrick: onTrick(state.rng, state.caravan.personal, state.caravan.cargo), leaderSide: a.playerAmbushes ? 0 : 1 });
+                          ...(a.rival ? { opponentPersonal: deployed(a.rival.caravan).personal, opponentCompanion: deployed(a.rival.caravan).companion, names: ["You", a.rival.ai.name, "Companion", `${a.rival.ai.civ} companion`] } : {}),
+                          trickLimit: E.ambushTrickLimit(combined), onPlay: onPlay(r), onTrick: onTrick(state.rng, state.caravan.personal, state.caravan.cargo), leaderSide: a.playerAmbushes ? 0 : 1,
+                          learnSuit: a.playerAmbushes ? (state.civ || state.ai?.civ) : (a.rival ? a.rival.ai.civ : a.faction) });   // the ambusher's identity (D-534)
   note(state, `The deck: ${a.picked.length} of your cards, ${oppExposed.length} of theirs${deck.length > combined ? `, topped up with ${deck.length - combined} local cards (D-227)` : ""}; at most ${m.trickLimit} tricks (D-220).`);
   m.richer = wealthTest(state, [state, a.rival, state, a.rival]); if (dep.companion) m.mercHalf = dep.companion.half;
   state.match = { m, at: state.caravan.at, kind: "ambush" }; state.phase = "match";
@@ -1503,6 +1827,13 @@ function finishAmbush(state) {
     a.lostFight = !(vP0 > vO0 || (vP0 === vO0 && !a.playerAmbushes));
     if (plan && a.lostFight && o.lost.length) { const keep = []; for (let k = 0; k < plan && o.lost.length; k++) keep.push(o.lost.splice(Math.floor(state.rng.next() * o.lost.length), 1)[0]);
       note(state, `Contingency Plan: you hold on to ${keep.map(cardName).join(", ")}.`, "good"); } }
+  // Herd Protection works for the rival caravan too (abilities apply where their text says, D-1203): its Wary Farmfolk VII saves
+  // one Farmfolk produce card each from what you'd take, two copies at most (D-352; D-1213)
+  if (a.rival) for (let k = Math.min(2, a.rival.caravan.personal.filter(FARMFOLK.wary).length); k > 0; k--) {
+    const cand = o.won.filter((x) => x.own === "opp" && FARMFOLK.produce(x)); if (!cand.length) break;
+    const saved = state.rng.pick(cand); o.won.splice(o.won.indexOf(saved), 1);
+    note(state, `Herd Protection: their Hajdú keeps ${cardName(saved)} out of your hands.`, "warn");
+  }
   const lost = new Set(o.lost.map((x) => x.ref));
   c.cargo = c.cargo.filter((x) => !lost.has(x));
   const won = o.won.map(plain); c.cargo.push(...won, ...m.generated);
@@ -1547,7 +1878,10 @@ function finishAmbush(state) {
 export function saddlebag(state, thief, victim, say) {
   if (!thief.personal.some(PLAINS.notorious) || !victim.cargo.length) return;
   if (slots(thief) >= thief.capacity) return say("Saddlebag Raid: no room in the wagon for anything more.");
-  const t = victim.cargo.splice(Math.floor(state.rng.next() * victim.cargo.length), 1)[0]; thief.cargo.push(t);
+  const k = Math.floor(state.rng.next() * victim.cargo.length);
+  // Herd Protection names cargo theft (makk.md): a Wary Farmfolk VII in the victim's personal deck keeps a produce card (D-1213)
+  if (FARMFOLK.produce(victim.cargo[k]) && victim.personal.some(FARMFOLK.wary)) return say(`Saddlebag Raid: a Hajdú's watch keeps ${cardName(victim.cargo[k])} from going missing.`);
+  const t = victim.cargo.splice(k, 1)[0]; thief.cargo.push(t);
   say(`Saddlebag Raid: ${cardName(t)} goes missing from a saddlebag.`);
 }
 // NPC bankruptcy (D-230, D-254): a caravan below 8 cargo after an encounter with you is out; its coins come to you, and you may take
@@ -1588,17 +1922,24 @@ function removeCargo(c, card) { const out = mates(c, card); c.cargo = c.cargo.fi
 // military strength: 1 per VII across cargo and the personal deck, rounded up (D-099, D-130, D-183, D-321)
 // Holy Host (Militant Clergy Király in the personal deck): each non-Seven Clergy face card in cargo adds half a Seven (piros.md)
 // military in a road encounter: Marching Formation (Marching Orders in the personal deck) adds its bonus (royal.md; amount PLACEHOLDER)
+// the stop-based bonuses in every road-encounter military check (D-895 (15)): Local Support (Fisherman's Papers, where Fisherfolk
+// live; two at most) and the Lurker (where Forestfolk live; not at checkpoints, D-372) (D-1204)
+const stopMilitary = (state) => { const c = state.caravan, local = state.event?.local || state.stops[c.at]?.suits || [];
+  return (local.includes("Fisherfolk") ? two(c.personal.filter(FISH.papers)).length : 0) + (local.includes("Forestfolk") && c.personal.some(MERC.lurker) ? 1 : 0); };
+const roadMilitaryAt = (state) => roadMilitary(state.caravan) + stopMilitary(state);
 export const roadMilitary = (c) => military(c) + (c.personal.some(KINGS.orders) ? PLACEHOLDER.marchingFormation : 0)
   + Math.ceil([...c.cargo, ...c.personal].filter(FOREST.hardy).length * PLACEHOLDER.roadDefence);   // Road Defence (Hardy Forager line): road encounters, not checkpoints (amount PLACEHOLDER)
 // Imposing Tradesfolk VII (Armed Escort / Hired Bodyguard / Elite Guard): 1.5 Sevens; Ruthless Tradesfolk Király in the
 // personal deck (Hired Swords): +2 Sevens (tok.md)
-export const military = (c) => Math.ceil([...c.cargo, ...c.personal].reduce((a, x) => a + (x.rank !== "VII" ? 0 : TRADES.imposing(x) ? 1.5 : 1), 0)
+// fractions are kept and the total rounds up once (D-183): militaryRaw is the unrounded sum, military() its rounded value (D-1204)
+export const military = (c) => Math.ceil(militaryRaw(c));
+export const militaryRaw = (c) => ([...c.cargo, ...c.personal].reduce((a, x) => a + (x.rank !== "VII" ? 0 : TRADES.imposing(x) ? 1.5 : 1), 0)
   // Armour Supply (Thick Forestfolk VIII line, cargo): each adds military; Pack Leader (Commanding Horn, personal deck): every Beasts card
   // in cargo adds military; both amounts PLACEHOLDER (zold.md: TBD)
   + c.cargo.filter(FOREST.thick).length * PLACEHOLDER.armourSupply
   + (c.personal.some(FOREST.commanding) ? c.cargo.filter((x) => x.suit === "Beasts").length * PLACEHOLDER.packLeader : 0)
   + (c.personal.some(CLERGY.militant) ? 0.5 * c.cargo.filter(CLERGY.face).length : 0)
-  + (c.personal.some(TRADES.ruthless) ? 2 : 0)
+  + 2 * two(c.personal.filter(TRADES.ruthless)).length   // Hired Swords: 2 Sevens each, two copies at most (D-352; D-1202)
   + [...c.cargo, ...c.personal].filter(CARNIVAL.lumbering).length   // Bear Guard: one Seven's military each, either deck
   // Armed Cargo (Battle-Worn Surplus Arms): 1 military in total however many (D-631); Cloak and Dagger (Sinister Concealed
   // Dagger line): each counts as a Seven (D-641)
@@ -1610,8 +1951,10 @@ export const military = (c) => Math.ceil([...c.cargo, ...c.personal].reduce((a, 
   + (c.cargo.some(BEASTS.pack) ? Math.floor(c.cargo.filter((x) => x.suit === "Beasts" && x.rank === "Alsó").length / 2) : 0));
 // Special Treatment (Enticing Tradesfolk Ász in the personal deck): tolls, crossings and upgrade costs 5 / 10 / 15 % cheaper
 // by stage (the best one counts); rounded up so a fee never drops below 1 by rounding (D-278)
-export const specialTreatment = (c) => Math.max(0, ...c.personal.filter(TRADES.enticing).map((x) => [0.05, 0.1, 0.15][x.refined || 0]));
-const discounted = (c, price, extra = 0) => price <= 0 ? price : Math.max(1, Math.ceil(price * (1 - Math.min(RULES.modifierCap, specialTreatment(c) + extra + (c.personal.some(ALT.lard) ? 0.05 : 0) + funny(c)))));   // + The Power of Zsír: services -5 %; Funny Money
+export const specialTreatment = (c) => best2(c.personal.filter(TRADES.enticing).map((x) => [0.05, 0.1, 0.15][x.refined || 0]));   // two at most (D-352)
+// Special Treatment cuts card upgrades, road charges, tolls and checkpoint fees, not merchandise, refining goods or other paid
+// services (tok.md); noST leaves it out (D-1204)
+const discounted = (c, price, extra = 0, noST = false) => price <= 0 ? price : Math.max(1, Math.ceil(price * (1 - Math.min(RULES.modifierCap, (noST ? 0 : specialTreatment(c)) + extra + (c.personal.some(ALT.lard) ? 0.05 : 0) + funny(c)))));   // + The Power of Zsír: services -5 %; Funny Money
 
 // D-662: a captured upgraded card arrives as an exact copy or as its base version; chance TBD (PLACEHOLDER). Region 1
 // encounter decks are unupgraded (D-450, D-406), so the roll changes nothing yet
@@ -1627,9 +1970,30 @@ function qualityRoll(state, x) {
 function plain(x) { const { id, origin, ownerSeat, ref, own, mercDeck, ...rest } = x; return rest; }
 
 // D-265 overflow, then whatever comes next
+// Beast of Burden leaving the personal deck (D-375): its +4 slots go at once, but nothing is discarded; the caravan may run over
+// capacity by up to those 4, with the extra suspicion of cargo above capacity, until the next cargo-management chance (a
+// settlement). Other capacity losses take effect as usual (D-867: losing Farmer's Papers is enforced). Incoming cargo still obeys
+// D-265 (D-1177)
+function syncCap(state) {
+  const c = state.caravan, cap = capacity(c), burden = c.personal.some(PLAINS.burden);
+  if (c.hadBurden && !burden) {
+    const over = Math.min((c.overCap || 0) + 4, Math.max(0, slots(c) - cap));
+    if (over > (c.overCap || 0)) note(state, `Beast of Burden is gone: capacity drops to ${cap}. You run ${over} over it until the next settlement, and the excess draws suspicion (D-375).`, "warn");
+    c.overCap = over;
+  }
+  c.hadBurden = burden;
+  c.overCap = Math.min(c.overCap || 0, Math.max(0, slots(c) - cap));
+  c.capacity = cap;
+}
+const capLimit = (c) => c.capacity + (c.overCap || 0);
+/** after a duel (a Zsír game, D-493): the wager won may overfill the wagon: the overflow step (D-265), then Scavenging (D-1217) */
+export function afterDuel(state, then = () => {}) {
+  if (state.phase === "overflow" || state.ended) return then();
+  const ph = state.phase; afterIncoming(state, () => { state.phase = ph; then(); }, true);
+}
 function afterIncoming(state, next, fromMatch = false) {
-  const c = state.caravan; c.capacity = capacity(c);
-  if (slots(c) > c.capacity) {
+  const c = state.caravan; syncCap(state);
+  if (slots(c) > capLimit(c)) {
     state.phase = "overflow"; state.afterOverflow = fromMatch ? () => { scavenging(state); next(); } : next;
     note(state, `The wagon is over capacity (${c.cargo.length} of ${c.capacity}): choose what to leave behind (D-265).`, "warn"); return;
   }
@@ -1666,7 +2030,7 @@ function falseAdvertising(state, m, card, price) {
 function discard(state, i, sold = false) {
   const c = state.caravan, [x] = removeCargo(c, c.cargo[i]);
   if (!sold) note(state, `Left behind ${cardName(x)}.`);
-  if (slots(c) <= c.capacity) { const next = state.afterOverflow; state.afterOverflow = null; next(); }
+  if (slots(c) <= capLimit(c)) { const next = state.afterOverflow; state.afterOverflow = null; next(); }
 }
 
 // a market commodity: a base VIII of a suit present, its version chosen at random among the suit's cards (D-487)
@@ -1685,8 +2049,18 @@ export function illicit(card) {
   return ILLICIT.some((x) => x.suit === card.suit && x.rank === card.rank && x.roster === (card.roster || "main") && x.stage === (card.refined || 0)
     && (card.name ? card.name === x.name || card.name.endsWith(" " + x.name) : x.roster === "main"));
 }
+function identifyAt(state, opts, action) {
+  const c = state.caravan, a = opts.actions.find((x) => x.type === "identify" && x.i === action.i && !!x.library === !!action.library);
+  if (!a || !a.allowed) throw new Error("not available");
+  if (a.library) { const k = c.personal.findIndex((x) => isCorr(x, "library")); c.personal.splice(k, 1); }
+  else { c.coins -= a.price; state.run.identified = (state.run.identified || 0) + 1; }
+  const id = identify(state.rng), card = corrCard(id, id === "transit" ? { region: regionNo(state) } : {});
+  c.personal[c.personal.indexOf(a.card)] = card; c.capacity = capacity(c);
+  note(state, `Church: ${a.library ? "your Library Card pays for it; " : `${a.price} coins; `}the glitched card resolves into ${card.name}. ${CORRUPTION[id].text}`, "good");
+}
 // the fence's counter: an illicit good at a random stage, or now and then a basic Rank X (markets never sell X, D-663)
 function fenceGood(rng) {
+  if (rng.next() < PLACEHOLDER.corruption.fenceChance) return glitched();          // a glitched Corruption card (D-751)
   if (rng.next() < PLACEHOLDER.fence.xChance) return E.cardFromStage(rng.pick(E.stagesOf((x) => x.rank === "X" && x.stage === 0 && x.roster !== "secret alternative")));
   return E.cardFromStage(rng.pick(ILLICIT));
 }
@@ -1712,7 +2086,22 @@ function fence(state, opts, action) {
     c.cargo.push(...got);
     return afterIncoming(state, () => { state.phase = "location"; if (lostRun(state)) return; });   // too much? the overflow step (D-265)
   }
-  if (action.type === "fence-buy") { c.coins -= a.price; c.cargo.push(f.stock.splice(action.i, 1)[0]); note(state, `Fence: bought ${cardName(a.card)} for ${a.price} coins, no questions asked.`); return; }
+  if (action.type === "fence-buy") { c.coins -= a.price; const got = f.stock.splice(action.i, 1)[0];
+    if (isCorr(got)) { c.personal.push(got); note(state, `Fence: bought a glitched card for ${a.price} coins. It sits in your personal deck as corrupted data until a church identifies it (D-751).`); return; }
+    c.cargo.push(got); note(state, `Fence: bought ${cardName(a.card)} for ${a.price} coins, no questions asked.`); return; }
+  if (action.type === "corr-sell") {
+    c.personal.splice(c.personal.indexOf(a.card), 1);
+    if (isCorr(a.card, "receipt")) {                       // D-773: five random basic commodities (pool per D-353), cargo rules apply
+      const got = Array.from({ length: 5 }, () => E.cardFromStage(state.rng.pick(E.stagesOf((x) => x.stage === 0 && x.roster !== "secret alternative" && E.isCommodity(x)))));
+      c.cargo.push(...got); note(state, `Fence: the Receipt turns into ${got.map(cardName).join(", ")}.`, "good");
+      return afterIncoming(state, () => { state.phase = "location"; });
+    }
+    if (isCorr(a.card, "lottery")) {                       // D-764: nothing 65 %, small 20 %, bigger 10 %, largest 5 %; amounts PLACEHOLDER
+      const x = state.rng.next(), L = PLACEHOLDER.corruption.lottery, win = x < 0.65 ? 0 : x < 0.85 ? L[0] : x < 0.95 ? L[1] : L[2];
+      c.coins += win; note(state, win ? `Fence: the Lottery Ticket wins ${win} coins!` : "Fence: the Lottery Ticket wins nothing.", win ? "good" : "info"); return;
+    }
+    c.coins += a.price; note(state, `Fence: sold ${cardName(a.card)} for ${a.price} coins.`); return;
+  }
   removeCargo(c, c.cargo[action.i]); c.coins += a.price; note(state, `Fence: sold ${cardName(a.card)} for ${a.price} coins${action.type === "fence-smuggle" ? `, smuggled in from Region ${a.from}` : ""}.`, action.type === "fence-smuggle" ? "good" : "info"); lostRun(state);
 }
 
@@ -1724,14 +2113,39 @@ function tavernFood(rng, tv) {
   const local = refined((x) => tv.suits.includes(x.suit)), opts = local.length ? local : refined(() => true);
   return E.cardFromStage(rng.pick(opts));
 }
-function tavernRumour(state, here) {
-  const c = state.caravan, key = `${here.id}:${state.round}`; if ((state.heardAt ||= new Set()).has(key)) return; state.heardAt.add(key);
+// settlement greetings carry rumours about the King's tastes (D-434, D-435): true or false, the true ones more often, no truth
+// labels; you judge by corroboration. Chance per settlement visit and truth chance PLACEHOLDER (D-1182)
+// a visit shows the market as it is now: demand and stock, remembered as last seen (D-435)
+function seeMarket(state, here) {
+  const mk = state.markets[here.id]; if (!mk || !state.known) return;
+  state.known[here.id] = { services: [...(here.services || [])], demand: { ...mk.demand }, stock: mk.stock.map(cardName), round: state.round, source: "seen" };
+}
+function greetingRumour(state, here) {
+  const r = state.rng, T = state.kingTastes; if (!T || r.next() >= PLACEHOLDER.greetingRumour) return;
+  // D-435: greetings carry rumours about the King's tastes, regional markets, POIs and other opportunities (equal shares, PLACEHOLDER)
+  const topic = r.pick(["king", "market", "place"]);
+  if (topic === "market") {                                // what another settlement has for sale: true or false, no label
+    const others = Object.keys(state.markets).filter((id) => id !== here.id && state.markets[id].stock.length);
+    if (others.length) { const id = r.pick(others), mk = state.markets[id], truth = r.next() < PLACEHOLDER.rumourTrue;
+      const said = truth ? cardName(r.pick(mk.stock)) : cardName(commodity(r, mk));
+      ((state.rumours ||= {}).market ||= {}); (state.rumours.market[id] ||= []).push({ said, round: state.round });
+      return note(state, `A greeting in ${here.name}: they say ${state.stops[id].name} has ${said} for sale.`); }
+  }
+  if (topic === "place") return tavernRumour(state, here, "A greeting");
+  const what = r.pick(["king", "up", "down"]), truth = r.next() < PLACEHOLDER.rumourTrue;
+  const suit = truth ? T[what] : r.pick(ALL_SUITS_.filter((x) => x !== T[what]));
+  ((state.rumours ||= {}).king ||= []).push({ what, suit });
+  const said = { king: `the King himself covets ${suit}`, up: `the Royal Castle pays well for ${suit}`, down: `the Royal Castle pays poorly for ${suit}` }[what];
+  note(state, `A greeting in ${here.name}: they say ${said}.`);
+}
+function tavernRumour(state, here, who = "Tavern talk") {
+  const c = state.caravan, key = `${who}:${here.id}:${state.round}`; if ((state.heardAt ||= new Set()).has(key)) return; state.heardAt.add(key);
   const hidden = state.board.stops.filter((x) => x.kind === "poi" && !state.discovered.has(x.id) && !state.visited.has(x.id));
-  if (!hidden.length) return note(state, "Tavern talk: nothing you haven't heard.");
+  if (!hidden.length) return who === "Tavern talk" ? note(state, "Tavern talk: nothing you haven't heard.") : undefined;
   const r = state.rng, poi = r.pick(hidden), kinds = [...new Set(state.board.stops.filter((x) => x.kind === "poi").map((x) => x.poi))];
   const said = r.next() < PLACEHOLDER.rumourTrue || kinds.length < 2 ? poi.poi : r.pick(kinds.filter((k) => k !== poi.poi));
   ((state.rumours ||= {})[poi.id] ||= []).push(said);
-  note(state, `Tavern talk: they say the place off the road at stop ${poi.stop} is ${/^[aeiou]/i.test(said) ? "an" : "a"} ${said}.`);
+  note(state, `${who}${who === "Tavern talk" ? "" : ` in ${here.name}`}: they say the place off the road at stop ${poi.stop} is ${/^[aeiou]/i.test(said) ? "an" : "a"} ${said}.`);
 }
 // ---- the Avaricious Profiteer's shops (mercenary #4, from Hawker; mercenaries.md; markups, stock and refresh PLACEHOLDER, deferred):
 // the travelling shop sells (never buys) a random commodity above market price wherever there's a shop or a roadside encounter; the
@@ -1768,18 +2182,19 @@ function bank(state, opts, action) {
 /** money earned at the end of a run counts invested principal and uncollected dividends (D-660, D-748) */
 export function investedWealth(c) { const inv = c.investment || { principal: 0, uncollected: 0 }; return { principal: inv.principal, uncollected: Math.ceil(inv.uncollected) }; }
 
-// every round each Market restocks a little (D-110, D-859 (9); amount PLACEHOLDER)
+// every round each Market, Fence and tavern refreshes its stock (D-110, D-859 (9); D-1237)
 function endRound(state) {
   state.round += 1;
+  if (state.caravan) syncCap(state);
   // investment dividends accrue every round the principal is invested (D-659: "qualifying rounds since the last collection"); simple,
   // on principal only; rate PLACEHOLDER (D-672: Banking House rates held); unspendable until collected at a Guild (D-747, D-825)
   const inv = state.caravan.investment;
   if (inv && inv.principal > 0) inv.uncollected += inv.principal * PLACEHOLDER.dividendPerRound;
   if (state.sharedMarkets) return;                       // an AI caravan's view of the shared markets: the world refreshes them once
-  for (const f of Object.values(state.fences || {})) if (f.stock.length < PLACEHOLDER.fence.stock) f.stock.push(fenceGood(state.rng));
-  for (const tv of Object.values(state.taverns || {})) if (tv.food.length < PLACEHOLDER.enc.innStock) tv.food.push(tavernFood(state.rng, tv));
-  for (const m of Object.values(state.markets))
-    for (let i = 0; i < PLACEHOLDER.refreshPerRound && m.stock.length < m.size; i++) m.stock.push(commodity(state.rng, m));
+  // inventories refresh every round, the paid restock being an extra refresh of the same kind (D-110, D-859 (9); D-1237)
+  for (const f of Object.values(state.fences || {})) { f.stock = []; while (f.stock.length < PLACEHOLDER.fence.stock) f.stock.push(fenceGood(state.rng)); }
+  for (const tv of Object.values(state.taverns || {})) { tv.food = []; while (tv.food.length < PLACEHOLDER.enc.innStock) tv.food.push(tavernFood(state.rng, tv)); }
+  for (const m of Object.values(state.markets)) { m.stock = []; while (m.stock.length < m.size) m.stock.push(commodity(state.rng, m)); }
 }
 
 // ---------------------------------------------------------------- Market (D-675, D-146, D-592; values PLACEHOLDER)
@@ -1805,7 +2220,7 @@ function demandFactor(m, suit, extra = 0) {
   const pct = (suit === m.demand.up ? PLACEHOLDER.demandUp : suit === m.demand.down ? -PLACEHOLDER.demandDown : 0) + extra;
   return 1 + Math.max(-RULES.modifierCap, Math.min(RULES.modifierCap, pct));
 }
-const advantage = () => (trader && trader.personal.some(TRADES.papers) ? 0.15 : 0);
+const advantage = () => (trader ? 0.15 * two(trader.personal.filter(TRADES.papers)).length : 0);   // two at most (D-352)
 // The Power of Zsír (Almighty Lard in the personal deck): commodity purchases 5 % cheaper (D-596), within the 60 % cap
 const lardOn = () => trader && trader.personal.some(ALT.lard);
 // Funny Money (Spurious Clipped Coins line, personal deck): purchases and services 4 / 8 / 12 % by stage, two copies at most (D-636, D-352)
@@ -1822,7 +2237,7 @@ function buyPriceBase(m, card) { return Math.max(1, buyRound(m.suits, card)(card
 const temptingBuy = (m, card) => (trader && (card.rank === "VIII" || card.rank === "X") && !(m.suits || []).includes("Forestfolk")
   ? Math.max(0, ...trader.personal.filter((x) => FOREST.beaver(x) && x.refined >= 1).map((x) => (x.refined >= 2 ? 0.05 : 0.02))) : 0);
 // Market Privileges (Leave Permit, personal deck): basic, unrefined VIII goods 10 % cheaper, within the 60 % cap (D-622, D-592)
-const privileges = (card) => (trader && trader.personal.some(RURAL_T.permit) && card.rank === "VIII" && !card.refined ? 0.1 : 0);
+const privileges = (card) => (trader && card.rank === "VIII" && !card.refined ? 0.1 * two(trader.personal.filter(RURAL_T.permit)).length : 0);
 // Luxury Trade (Haughty rural Mercer, personal deck; two at most): fully refined VIII / X sell +30 % (D-538); Wandering's Covered
 // Wagon: commodities sell +10 %, Kocsi: buy -10 % (two at most, D-551, D-352)
 const luxury = (card) => (trader && (card.rank === "VIII" || card.rank === "X") && (card.refined || 0) >= 2 ? 0.3 * Math.min(2, trader.personal.filter(RURAL.haughty).length) : 0);
@@ -1830,7 +2245,7 @@ const wanderSell = (card) => (trader && (card.rank === "VIII" || card.rank === "
 const wanderBuy = (card) => (trader && (card.rank === "VIII" || card.rank === "X") ? 0.1 * Math.min(2, trader.personal.filter((x) => RURAL.wandering(x) && x.refined >= 2).length) : 0);
 // Discount (rural Travelling Merchant; personal deck, reading): 20 % off base-stage VIII and X goods, not Tradesfolk, bought from
 // markets and peddlers (D-535)
-const peddlerDiscount = (card) => (trader && trader.personal.some(RURAL.merchant) && (card.rank === "VIII" || card.rank === "X") && !card.refined && card.suit !== "Tradesfolk" ? 0.2 : 0);
+const peddlerDiscount = (card) => (trader && (card.rank === "VIII" || card.rank === "X") && !card.refined && card.suit !== "Tradesfolk" ? 0.2 * two(trader.personal.filter(RURAL.merchant)).length : 0);
 // Savoury Pork / Kolbász in the personal deck: Plainsfolk commodities sell +2 % / +4 %, not stacking (D-595)
 const pigBonus = (card) => card.suit === "Plainsfolk" && (card.rank === "VIII" || card.rank === "X") && trader
   ? Math.max(0, ...trader.personal.filter((x) => ALT.pig(x) && x.adjective === "Savoury" && (x.refined || 0) >= 1).map((x) => (x.refined >= 2 ? 0.04 : 0.02))) : 0;
@@ -1844,7 +2259,7 @@ function sellPriceBase(m, card) {
   if (RURAL.essential(card) && (m.tier === "village" || m.tier === "market town")) return Math.ceil(cardValue(card) * 2);
   if (RURAL_T.hearty(card) && card.refined >= 2) return Math.ceil(plainSell(m, card) * 2);   // Premium Sale: Bread 200 %, everywhere, after the percentages (D-618, D-592)
   if (ALT.weapons(card) && card.adjective === "Battle-Worn" && card.refined === 1 && m.tier === "village") return Math.ceil(plainSell(m, card) * 1.5);   // Country Buyers (D-631)
-  return plainSell(m, card) + (decadent(card) && !card.refined && (m.tier === "market town" || m.tier === "town") ? Math.ceil(cardValue(card) * 0.4) : 0);
+  return plainSell(m, card) + (decadent(card) && !card.refined && (m.tier === "market town" || m.tier === "town") ? Math.ceil((PLACEHOLDER.cardValue[card.rank] ?? 1) * 0.4) : 0);   // of its base card value (D-563), not the adjective's price
 }
 // Local Sale Price Bonus (Down, Feather Bedding): by settlement tier, Down +3 / 8 / 13 / 18 %, Feather Bedding +5 / 10 / 15 / 20 %, of
 // that card's price, rounded up (D-503, D-656)
@@ -1852,11 +2267,14 @@ const TIER_INDEX = { village: 0, "market town": 1, town: 2, city: 3 };
 const featherBonus = (m, card) => (AGRI.down(card) ? [[0.03, 0.08, 0.13, 0.18], [0.05, 0.1, 0.15, 0.2]][card.refined >= 2 ? 1 : 0][TIER_INDEX[m.tier] ?? 0] : 0);
 // Trade Privileges (Smith's Papers, personal deck): Hillfolk VIII +10 % where Hillfolk don't live; Seller's Market (Circulating Silver,
 // personal deck; the best one): VIII and X +2 / 6 / 10 %; Buyer's Market (Hoarded Gold) buying -2 / 6 / 10 % (D-587, D-588)
-const smithBonus = (m, card) => (trader && card.suit === "Hillfolk" && card.rank === "VIII" && !(m.suits || []).includes("Hillfolk") && trader.personal.some(HILL.smiths) ? 0.1 : 0);
+const smithBonus = (m, card) => (trader && card.suit === "Hillfolk" && card.rank === "VIII" && !(m.suits || []).includes("Hillfolk") ? 0.1 * two(trader.personal.filter(HILL.smiths)).length : 0);
 const metalPct = (pred, card) => (trader && (card.rank === "VIII" || card.rank === "X") ? Math.max(0, ...trader.personal.filter((x) => pred(x) && x.adjective).map((x) => [0.02, 0.06, 0.1][x.refined || 0])) : 0);
 // Reed Trade (Reed Thatcher, personal deck): Fisherfolk VIII and X sell +20 %, stacking twice
 const reedTrade = (card) => (trader && card.suit === "Fisherfolk" && (card.rank === "VIII" || card.rank === "X") ? 0.2 * Math.min(2, trader.personal.filter(FISH.thatcher).length) : 0);
-function plainSell(m, card) { const fb = featherBonus(m, card) + smithBonus(m, card) + metalPct(HILL.silver, card) + reedTrade(card); return Math.max(1, (card.cutPct || pigBonus(card) || luxury(card) || wanderSell(card) || fb ? Math.ceil : Math.round)(cardValue(card) * sellMult(m.suits, card) * demandFactor(m, card.suit, advantage() + pigBonus(card) + luxury(card) + wanderSell(card) + fb + (card.cutPct || 0) / 100))); }
+// regional scarcity (D-417, D-423): a commodity whose suit lives nowhere in this region sells at a premium, stacking with the
+// settlement's demand (both percentages, within the 60 % cap, D-592); PLACEHOLDER amount (D-1195)
+const scarcity = (m, card) => (m.region && E.isCommodity(card) && !m.region.includes(card.suit) ? PLACEHOLDER.regionalScarcity : 0);
+function plainSell(m, card) { const fb = featherBonus(m, card) + smithBonus(m, card) + metalPct(HILL.silver, card) + reedTrade(card) + scarcity(m, card); return Math.max(1, (card.cutPct || pigBonus(card) || luxury(card) || wanderSell(card) || fb ? Math.ceil : Math.round)(cardValue(card) * sellMult(m.suits, card) * demandFactor(m, card.suit, advantage() + pigBonus(card) + luxury(card) + wanderSell(card) + fb + (card.cutPct || 0) / 100))); }
 
 // ---------------------------------------------------------------- checkpoint (D-107, D-109, D-713, D-719)
 export function requirementStatus(state) {
@@ -1866,12 +2284,13 @@ export function requirementStatus(state) {
     return { rank: PLAYTEST.rank, count: PLAYTEST.count, have: suits.size, met: suits.size >= PLAYTEST.count, playtest: true, label: PLAYTEST.label, suits: [...suits] };
   }
   const r = state.requirement;
-  const all = [...c.cargo, ...c.personal];
+  const all = [...c.cargo, ...c.personal].filter((x) => x.suit !== "Corruption");   // a mercenary's Corruption card is never demanded by rank or suit (D-348; D-1178)
   // checkpoint sabotage (Assassination Tools, D-657, D-940): the guards ask for one card fewer, minimum 1; with two lines (Exports),
   // the first line that asks for more than one gives it up
   const sab = state.sabotage ? 1 : 0, cut = r.parts ? r.parts.findIndex((p) => p.count > 1) : -1;
   // a toll (D-947): coins in hand against the amount; sabotage takes one step (10) off; Expedited Inspection doesn't apply
-  if (r.kind === "toll") { const amount = Math.max(10, r.count - (sab ? 10 : 0));
+  // Special Treatment (Enticing Tradesfolk Ász, personal deck) cuts checkpoint fees too: 5 / 10 / 15 % (tok.md; D-1202)
+  if (r.kind === "toll") { const amount = Math.ceil(Math.max(10, r.count - (sab ? 10 : 0)) * (1 - specialTreatment(c)));
     return { id: r.id, kind: "toll", title: r.title, ask: `a toll of ${amount} coins` + (sab ? " (cut: sabotage)" : ""), short: r.short, count: amount, test: r.test, have: Math.min(c.coins, amount), met: c.coins >= amount, expedited: false, sabotage: !!sab }; }
   const parts = r.parts && r.parts.map((p, i) => (sab && i === cut ? { ...p, count: p.count - 1 } : p));
   const count = Math.max(1, r.count - (sab && (!r.parts || cut >= 0) ? 1 : 0));
@@ -1902,6 +2321,9 @@ function highwayToll(state) {
   // Tax Evasion (Ebborz, personal deck): no ordinary tolls, and so no Highway Robbery payout either (D-498, D-499)
   if (state.caravan.personal.some(AGRI.ebborz)) return { kind: "toll", amount: 0, label: "highway toll (waived: Tax Evasion)", waived: true };
   if (state.caravan.personal.some(BANDITS.highwayman)) return { kind: "toll", amount: 0, label: "highway toll (Highway Robbery: you collect it)", waived: true, robbery: RULES.highwayToll };
+  // Monthly Transit Pass: free in the region where it was identified (D-764; reading D-1186); Punched Tram Ticket: one toll, used up (D-767)
+  if (state.caravan.personal.some((x) => isCorr(x, "transit") && x.region === regionNo(state))) return { kind: "toll", amount: 0, label: "highway toll (waived: Monthly Transit Pass)", waived: true };
+  if (state.caravan.personal.some((x) => isCorr(x, "tram"))) return { kind: "toll", amount: 0, label: "highway toll (waived: Punched Tram Ticket)", waived: true, tram: true };
   return { kind: "toll", amount: discounted(state.caravan, RULES.highwayToll), label: "highway toll" };
 }
 // both tolls (5 + 5, D-118) are paid now, in coins only (D-323, D-871 (1)); the settlement is a full visit (D-109: "a settlement
@@ -1922,9 +2344,9 @@ function emergency(state) {
 
 // ---------------------------------------------------------------- suspicion (D-128 to D-132, D-165; suspicion.md §3)
 export function suspicion(state) {
-  const c = state.caravan, all = [...c.cargo, ...c.personal];
+  const c = state.caravan, all = [...c.cargo, ...c.personal].filter((x) => !isCorr(x));   // Corruption cards: no rank-based suspicion (D-348, D-752)
   // Smuggling Expert (Chapman's Papers, personal deck): X and Ász generate 50 % of their normal suspicion (D-546; D-507, D-510)
-  const smug = c.personal.some(RURAL.chapman) ? 0.5 : 1;
+  const smug = Math.pow(0.5, two(c.personal.filter(RURAL.chapman)).length);   // multipliers multiply (D-507), two at most (D-352)
   const contraband = all.reduce((a, x) => a + (((x.rank === "X" || x.rank === "Ász") ? 1 : 0) + (x.suit === "Bandits" ? 1 : 0)) * ((x.rank === "X" || x.rank === "Ász") ? smug : 1), 0);
   // 1 per VII (R-34); Imposing 1.5; Concealed Threat (Unflinching Carnivalfolk VII) half; Bear Guard counts as a Seven (D-357)
   const escort = c.personal.some(KINGS.strict);
@@ -1935,6 +2357,14 @@ export function suspicion(state) {
   const official = c.personal.some(KINGS.orders) && c.personal.filter((x) => x.suit === "King's Men").length * 2 > c.personal.length;
   if (all.some((x) => ALT.weapons(x) && x.adjective === "Battle-Worn" && x.refined >= 2)) military += 1;   // Armed Cargo, capped at 1
   military += all.filter((x) => ALT.dagger(x) && x.adjective === "Sinister" && !x.refined).length;          // Cloak and Dagger: 1 / 0 / 0
+  // the military abilities count at checkpoints too, unless their card or a decision says otherwise (your ruling, 2026-11-20;
+  // D-1203): Armour Supply, Pack Leader, Holy Host and Hired Swords (Road Defence says "not at checkpoints", so it stays out)
+  military += c.cargo.filter(FOREST.thick).length * PLACEHOLDER.armourSupply
+    + (c.personal.some(FOREST.commanding) ? c.cargo.filter((x) => x.suit === "Beasts").length * PLACEHOLDER.packLeader : 0)
+    + (c.personal.some(CLERGY.militant) ? 0.5 * c.cargo.filter(CLERGY.face).length : 0)
+    + 2 * two(c.personal.filter(TRADES.ruthless)).length
+    + (state.stops?.[c.at]?.kind === "checkpoint" ? state.cpBribery?.military || 0 : 0)   // military bought with Bribery here
+    + (state.stops?.[c.at]?.kind === "checkpoint" && (state.stops[c.at].suits || []).includes("Fisherfolk") ? two(c.personal.filter(FISH.papers)).length : 0);   // Local Support at a checkpoint with Fisherfolk
   if (c.cargo.some(BEASTS.pack)) military += Math.floor(c.cargo.filter((x) => x.suit === "Beasts" && x.rank === "Alsó").length / 2);   // Pack Hunting (D-128, D-130)
   if (official) military = 0;
   // Farmer's Papers: suspicion-free up to 40; Structural Improvements (Ingenious Townsfolk Ász, personal deck): threshold 40,
@@ -1949,6 +2379,10 @@ export function suspicion(state) {
     bundle: new Set(c.cargo.filter((x) => x.bundle && !x.bundle.golden).map((x) => x.bundle.id)).size * PLACEHOLDER.stickyBundleSuspicion,
     // the Oracle's intrinsically high suspicion (Clergy Ász at Oracle, D-653: kept, value TBD -> PLACEHOLDER)
     oracle: all.filter((x) => x.suit === "Clergy" && x.rank === "Ász" && (!x.roster || x.roster === "main") && (x.refined || 0) >= 2).length * PLACEHOLDER.oracleSuspicion,
+    // the Golden-Fleeced Lamb is highly suspicious contraband (makk.md; D-651 keeps the lamb's own suspicion; value TBD -> PLACEHOLDER; D-1204)
+    golden: all.filter((x) => x.suit === "Farmfolk" && x.rank === "Ász" && (!x.roster || x.roster === "main") && (x.refined || 0) >= 2).length * PLACEHOLDER.goldenFleeceSuspicion,
+    // reported to the King's Men after refusing their caravan's challenge (D-412; D-1185): lasts to the end of the region; PLACEHOLDER
+    reported: c.reported || 0,
   };
   // concealment: negative suspicion (D-259). Base concealment 1 for a dry card other than a VII (D-351), used only by
   // abilities that refer to it; multipliers multiply (D-507); fractions kept, the final total rounds up (D-510), never below 0
@@ -1957,14 +2391,14 @@ export function suspicion(state) {
   parts.concealment = -(
     (c.personal.some(FARMFOLK_IX.agriculturalConcealment) ? K.agricultural * c.cargo.filter(agri).length : 0)        // Agricultural Concealment
     + (c.personal.some(CLERGY_IX.highwayFeeExemption) ? K.general : 0)                                               // General Concealment
-    + (c.personal.some(TRADES.papers) ? K.professional * c.cargo.filter((x) => x.rank === "Felső").length : 0)       // Professional Concealment
+    + K.professional * two(c.personal.filter(TRADES.papers)).length * c.cargo.filter((x) => x.rank === "Felső").length   // Professional Concealment (two at most)
     // base-concealment multipliers multiply per card (D-507): Hidden Compartments 2, Scrap Pile 1.5, False Manifest 2 (Bandits VIII),
     // Plain Goods 1.5 (basic commodities), Innocuous Cargo 1.5 (rank VIII cargo); a card counts its base only when one applies (D-351)
     + all.reduce((a, x) => { const inCargo = c.cargo.includes(x); let k = 1, any = false; const mul = (on, f) => { if (on) { k *= f; any = true; } };
         mul(inCargo && x.suit === "Tradesfolk" && x.rank === "VIII" && x.adjective === "Bulky", 2);
         mul(ALT.weapons(x) && x.adjective === "Battle-Worn" && !x.refined, 1.5);
         mul(inCargo && c.personal.some(BANDITS.papers) && x.suit === "Bandits" && x.rank === "VIII", 2);
-        mul(inCargo && c.personal.some(RURAL_T.permit) && E.isCommodity(x) && !x.refined, 1.5);
+        for (const _ of two(c.personal.filter(RURAL_T.permit))) mul(inCargo && E.isCommodity(x) && !x.refined, 1.5);   // Plain Goods, two at most, multiplying
         mul(inCargo && c.personal.some(AGRI.leaf) && x.rank === "VIII", 1.5);
         mul(inCargo && FISH.basket(x), 1.5);                                      // Fake Bottom (Basket / Barrel of Loaches, cargo)
         mul(inCargo && c.personal.some(FOREST.noble) && x.suit === "Forestfolk" && ["Alsó", "Felső", "Király", "Ász"].includes(x.rank), 1.5);   // Outlaw's Protection (D-304; an Ász has none to raise)
@@ -1977,7 +2411,7 @@ export function suspicion(state) {
     // Solitary Hunter: the caravan's only Beasts Felső, Solitary and in cargo: three Felső's base concealment instead of its own
     + (all.filter((x) => x.suit === "Beasts" && x.rank === "Felső").length === 1 && c.cargo.some(BEASTS.solitary) ? 3 : 0)
     );
-  const raw = parts.contraband + parts.military + parts.cargo + parts.personal + parts.oracle + parts.bundle + parts.concealment
+  const raw = parts.contraband + parts.military + parts.cargo + parts.personal + parts.oracle + parts.golden + parts.bundle + parts.concealment
     + ((state.stops?.[c.at]?.kind === "checkpoint" && c.personal.some(PLAINS.papers)) ? -(state.goodwillVisits || 0) : 0);
   // at the checkpoint only: Checkpoint Influence (automatic) and the Bribery bonuses bought there, as concealment percentages
   // of the total (multipliers multiply, D-507)
@@ -2001,7 +2435,7 @@ export function influence(c) {
   return best >= 2 ? (c.personal.some(CLERGY.proselytising) ? 0.2 : 0.15) : 0.05;
 }
 // a qualifying ability opens the Bribe after discovery and requirement bribery (D-737): Bribery (Coveted Tradesfolk X in
-// cargo) or Checkpoint Influence; Bandits Ász, Mutineer and Liquid Diplomacy aren't in this build
+// cargo), Checkpoint Influence, Checkpoint Bribery (Brazen Bandits Ász), the Mutineer, Liquid Diplomacy or The Power of Zsír (canBribe)
 // Liquid Diplomacy (Decadent Authentic Aszú, personal deck) unlocks Checkpoint Bribery; both bribes 15 % cheaper (D-564)
 const liquid = (c) => c.personal.some((x) => decadent(x) && x.refined >= 2);
 export const canBribe = (c) => c.personal.some(MERC.mutineer) || c.cargo.some(TRADES.coveted) || c.personal.some(CLERGY.radiant) || [...c.cargo, ...c.personal].some(BANDITS.brazen) || liquid(c) || c.personal.some(ALT.lard);   // + The Power of Zsír (D-598)
@@ -2013,9 +2447,10 @@ function briberyOffers(state) {
   // Checkpoint Bribery (Brazen Bandits Ász, either deck) uses the same system and scale by its stage (reading; thug.md: "the same
   // underlying bribery system used by Tradesfolk X"), counted against the same two-card limit
   const pool = [...c.cargo.map((card, i) => ({ card, i, deck: "cargo" })), ...c.personal.map((card, i) => ({ card, i, deck: "personal" }))];
-  return pool.filter(({ card }) => (TRADES.coveted(card) || BANDITS.brazen(card)) && !used.includes(card)).map(({ card, i, deck }) => {
+  // Coveted Tradesfolk X works from cargo (tok.md: "stat-upgraded Tradesfolk X cargo"); Brazen from either deck (D-1202)
+  return pool.filter(({ card, deck }) => ((TRADES.coveted(card) && deck === "cargo") || BANDITS.brazen(card)) && !used.includes(card)).map(({ card, i, deck }) => {
     const r = card.refined || 0, price = Math.ceil(PLACEHOLDER.checkpointToll * [0.5, 0.7, 0.9][r]);
-    return { type: "bribery", i, deck, card, pct: [0.1, 0.2, 0.3][r], price, allowed: c.coins >= price };
+    return { type: "bribery", i, deck, card, pct: [0.1, 0.2, 0.3][r], military: PLACEHOLDER.briberyMilitary[r], price, allowed: c.coins >= price };
   });
 }
 // requirement bribery (D-108; values CHK-11, PLACEHOLDER): mult x the value of the missing required cards, for at most half
@@ -2035,22 +2470,25 @@ function requirementBribe(state) {
 // the inspection Bribe (D-136, D-167: a share of current coins; CHK-18 acceptance PLACEHOLDER): the chance grows with the share
 // offered and falls with the inspection's size (severity) and after refusing the routine guard (D-168, CHK-21); paid only
 // if accepted; a refusal leads to the checkpoint encounter
-function inspectionBribes(state) {
-  const c = state.caravan, B = PLACEHOLDER.inspectionBribe, ins = state.inspection;
+function inspectionBribes(state, ins = state.inspection) {
+  const c = state.caravan, B = PLACEHOLDER.inspectionBribe;
   if (!canBribe(c) || c.coins <= 0) return [];
   // D-136: acceptance depends on the share offered, journey progression and severity (inspection size, D-137); harder after
   // refusing the routine guard (D-168)
-  const hard = B.need * (ins.size / 3) * (state.refusedGuard ? B.refusedGuard : 1) * progression(state);
-  return B.offers.map((share) => ({ type: "bribe", share, amount: Math.max(1, Math.ceil(c.coins * share * (liquid(c) ? 0.85 : 1) * (1 - solitude(c)))), chance: Math.min(B.maxChance, share / hard) }));
+  // refusing the routine guard makes later inspection bribes cost significantly more (D-168; D-1244): the same acceptance chance
+  // for a dearer payment (rate PLACEHOLDER)
+  const hard = B.need * (ins.size / 3) * progression(state), dear = state.refusedGuard ? B.refusedGuard : 1;
+  return B.offers.map((share) => ({ type: "bribe", share, amount: Math.max(1, Math.min(c.coins, Math.ceil(c.coins * share * dear * (liquid(c) ? 0.85 : 1) * (1 - solitude(c))))), chance: Math.min(B.maxChance, share / hard) }));
 }
 
 // ---------------------------------------------------------------- the checkpoint (D-107, D-133 to D-141, D-158, D-737)
 function submit(state) {
   const st = requirementStatus(state);
   // Safe Passage (Juggler's Papers, personal deck): requirements not met: 50 % to pass anyway; the inspection still follows
+  // two copies at most, each rolling on its own (ABL-21 resolved by D-352; D-533; D-1221)
   if (!st.met && !st.playtest && state.caravan.personal.some(CARNIVAL.papers)) {
-    if (state.rng.next() < luck(state, 0.5)) { note(state, `Safe Passage: the guards wave the Juggler's papers through despite ${st.have} of ${st.ask}.`, "good"); st.met = true; }
-    else note(state, "Safe Passage: not this time (50%).", "warn");
+    for (const _ of two(state.caravan.personal.filter(CARNIVAL.papers))) if (!st.met && state.rng.next() < luck(state, 0.5)) { note(state, `Safe Passage: the guards wave the Juggler's papers through despite ${st.have} of ${st.ask}.`, "good"); st.met = true; }
+    if (!st.met) note(state, "Safe Passage: not this time (50%).", "warn");
   }
   // Expedited Inspection: 25 %, a beneficial roll (D-378: roll bonuses apply), once per submission (D-946)
   if (!st.met && !st.playtest && st.expedited) {
@@ -2058,13 +2496,31 @@ function submit(state) {
     else note(state, `Expedited Inspection: the guards insist on the full count this time (${Math.round(PLACEHOLDER.expeditedChance * 100)}%).`, "warn");
   }
   if (!st.met) {
+    const rb = !st.playtest && requirementBribe(state);
+    if (rb && rb.allowed) { state.phase = "shortfall"; note(state, `Short of the requirement (${st.have} of ${st.ask}): the guards can be paid to look past it (D-107, D-108).`, "warn"); return; }
+    return endShort(state, st);
+  }
+  return afterRequirements(state, st);
+}
+function endShort(state, st) {
+  {
     state.ended = { won: false, reason: st.playtest ? `PLAYTEST requirement not met: ${st.have} of ${st.count} different suits of Rank VIII. The run ends.`
                                                     : st.kind === "toll" ? `You can't pay the toll: ${st.have} of ${st.count} coins. The run ends (D-107).` : `Requirements not met (${st.title}): ${st.have} of ${st.ask}. The run ends (D-107).` };
     note(state, state.ended.reason, "bad"); return;
   }
-  if (st.kind === "toll") { state.caravan.coins -= st.count; note(state, `Toll paid: ${st.count} coins to the guards.`, "warn"); }
+}
+// the requirement met (or bribed): the toll, then the suspicion-based inspection (D-107)
+function afterRequirements(state, st) {
+  // a toll is paid with what you have: when Safe Passage or Expedited Inspection let an unpaid toll through, you pay what you hold
+  // and no more (coins never go below 0; D-1204)
+  if (st.kind === "toll") { const paid = Math.min(state.caravan.coins, st.count); state.caravan.coins -= paid; note(state, `Toll paid: ${paid} coins to the guards${paid < st.count ? ` (all you had; the rest waived)` : ""}.`, "warn"); }
   else if (st.have >= st.count) note(state, `Requirements met (${st.title}: ${st.have} of ${st.ask}).`, "good");
   const sus = suspicion(state);
+  // Get Out of Inspection Free: skips the scheduled inspection, never the Royal Castle's; one use (D-752; reading: used automatically
+  // at the next scheduled checkpoint inspection, D-1186)
+  if (state.cpFree) { state.cpFree = false; return pass(state, `Suspicion ${sus.total}, but the guards wave you through as promised after the Carnival (D-407): no inspection.`); }
+  const free = sus.inspection && !state.final ? state.caravan.personal.findIndex((x) => isCorr(x, "jailfree")) : -1;
+  if (free >= 0) { state.caravan.personal.splice(free, 1); return pass(state, `Suspicion ${sus.total}, but you hand over the Get Out of Inspection Free card: no inspection.`); }
   if (sus.inspection) { note(state, `Suspicion ${sus.total}: a scheduled ${sus.inspection === 5 ? "thorough" : "standard"} inspection of ${sus.inspection} cards (D-133).`, "warn"); return inspect(state, sus.inspection, 1); }
   note(state, `Suspicion ${sus.total}: no scheduled inspection (0–10, D-133).`);
   // Routine Check Prevention (Indomitable rural Townsfolk Ász, personal deck): no routine inspection (D-627)
@@ -2125,13 +2581,13 @@ function fieldMedicine(state, found) {
   return found.filter((d) => !saved.includes(d));
 }
 function surrender(state) {
-  const c = state.caravan, { n } = state.inspection, found = fieldMedicine(state, state.inspection.found);
+  const c = state.caravan, { n } = state.inspection, found = returnFromConfiscation(state, fieldMedicine(state, state.inspection.found));
   for (const d of found) { const deck = d.from === "cargo" ? c.cargo : c.personal; deck.splice(deck.indexOf(d.card), 1); }
   if (found.length) note(state, `Surrendered ${found.map((d) => `${d.card.rank} ${d.card.suit}`).join(", ")}: removed permanently (D-136).`, "warn");
   c.capacity = capacity(c);
   if (lostRun(state)) return;
   if (n === 1) {                                                                // a second inspection of random size (D-137; sizes PLACEHOLDER)
-    const size = state.rng.pick(PLACEHOLDER.secondInspectionSizes);
+    const size = secondSize(state);
     note(state, `Surrendering triggers a second inspection: ${size} cards.`, "warn");
     return inspect(state, size, 2);
   }
@@ -2150,6 +2606,13 @@ function fight(state) {
 }
 
 // D-140, D-141, D-169, D-219: only cards that entered a trick change hands; survival = 8+ cargo cards afterwards
+// Return from Confiscation (Star-Eyed Shepherd): lost from cargo in a checkpoint encounter, surrender included (it overrides the
+// surrendered contraband's permanent removal, townsfolk-rural.md; D-903; D-1204): he stays where he was
+function returnFromConfiscation(state, found) {
+  const keep = found.filter((d) => RURAL_T.starEyed(d.card));
+  if (keep.length) note(state, "Return from Confiscation: the Star-Eyed Shepherd walks back where he came from.", "good");
+  return found.filter((d) => !keep.includes(d));
+}
 function finishCheckpointMatch(state) {
   const { m } = state.match, c = state.caravan, o = checkpointOutcome(m); mercShare(state, m);
   // Return from Confiscation (Star-Eyed Shepherd): lost in the checkpoint fight, he comes back where he came from, before the
@@ -2198,9 +2661,12 @@ function pass(state, how) {
 // ---------------------------------------------------------------- the Capital Region: Castle Town, the Royal Castle, the score
 // The castle buys all delivered cargo by its suit preferences (D-433, D-146), plus the King's own random preference, known only on
 // reaching the Capital Region (D-434). Multipliers PLACEHOLDERS (PLACEHOLDER.castle)
+function rollTastes(r) {
+  const suits = ALL_SUITS_.slice(), up = r.pick(suits), down = r.pick(suits.filter((x) => x !== up)), king = r.pick(suits.filter((x) => x !== up && x !== down));
+  return { up, down, king };
+}
 function castlePreferences(state) {
-  const r = state.rng, P = PLACEHOLDER.castle, suits = ALL_SUITS_.slice();
-  const up = r.pick(suits), down = r.pick(suits.filter((x) => x !== up)), king = r.pick(suits.filter((x) => x !== up && x !== down));
+  const P = PLACEHOLDER.castle, { up, down, king } = state.kingTastes || rollTastes(state.rng);
   state.castle = { up, down, king };
   note(state, `Word in the Capital Region of the Royal Castle's tastes: it pays well for ${up} (×${P.up}), poorly for ${down} (×${P.down}); the King himself covets ${king} (×${P.king}).`, "event");
 }

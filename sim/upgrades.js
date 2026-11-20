@@ -133,7 +133,7 @@ export const CATALOGUE = {
   "Tradesfolk Ász (rural)": {
     stages: ["Cart", "Covered Wagon", "Kocsi"], adjective: "Wandering", alt: true,
     refine: { at: "Guild", prices: [9, 14], gives: ["Covered Wagon: The Peddler's Here!: the last player swaps their card for a higher one from their hand (once per encounter).", "Kocsi: all three other players."] },
-    adj: { at: "Guild", price: 49, gives: "Wandering, cumulative (personal deck): +8 cargo slots; Covered Wagon also sells 10% dearer; Kocsi also buys 10% cheaper." },
+    adj: { at: "Guild", price: 49, gives: "Wandering (personal deck; each stage keeps the last): wagon capacity 40 (doesn't add to the Peasant Wagon, D-555); Covered Wagon also sells 10% dearer; Kocsi also buys 10% cheaper." },
     source: "docs/cards/tok-rural.md; D-551 to D-555",
   },
   // ---- the rural Townsfolk roster (townsfolk-rural.md; D-606 to D-628; dealt as rural Tradesfolk, D-901). Institutions by
@@ -147,7 +147,7 @@ export const CATALOGUE = {
   "Townsfolk VIII (rural)": {
     stages: ["Bolted Flour", "Bread Dough", "Bread"], adjective: "Hearty", alt: true,
     refine: { at: "Guild", prices: [4, 4], gives: ["Bread Dough: Sticky Dough: played on the card to match, it becomes the card to match.", "Bread: keeps Sticky Dough; Rising: an Alsó, Felső or Király played on it may refine for the trick (50%)."] },
-    adj: { at: "Guild", price: [1, 1, 7], gives: "Premium Sale: Bread sells for 200% (inactive until Bread)." },
+    adj: { at: "Guild", price: [1, 1, 7], gives: "Premium Sale: sells for 200% (activates at a later refinement)." },   // D-729: the activating stage isn't named
     source: "docs/cards/townsfolk-rural.md; D-617, D-618, D-654",
   },
   "Townsfolk IX (rural)": {
@@ -191,7 +191,7 @@ export const CATALOGUE = {
   "Beasts VII (agricultural)": {
     stages: ["Locust Swarm", "Plague"], adjective: "Devouring", alt: true,
     refine: { at: "Guild", prices: [86], gives: ["Plague: Devour: the two cards directly beneath it go straight to you (once per encounter)."] },
-    adj: { at: "Magistrates", price: 1, gives: "Infestation: in an ambush, an exposed opposing VIII becomes a Locust Swarm (needs persistent opposing caravans)." },
+    adj: { at: "Magistrates", price: 1, gives: "Infestation: in an ambush, an exposed opposing VIII becomes a Locust Swarm." },
     source: "docs/cards/beasts-agricultural.md; D-500, D-501, D-655",
   },
   "Beasts VIII (agricultural)": {
@@ -227,7 +227,7 @@ export const CATALOGUE = {
   "Beasts Király (agricultural)": {
     stages: ["Badger", "Ebborz"], adjective: "Tenacious", alt: true,
     refine: { at: "Magistrates", prices: [43], gives: ["Ebborz: Tax Evasion (personal deck): no highway tolls or crossing fees; with Tenacious, the protection extends above later Beasts cards."] },
-    adj: { at: "Guild", price: 4, gives: "Tenacious: a claim by ability made directly on top of it is blocked until another card covers it." },
+    adj: { at: "Guild", price: 4, gives: "Tenacious: any claim made directly on top of it, Sevens and abilities included, is blocked unless it matches the rank, until another card covers it (D-905, D-909)." },
     source: "docs/cards/beasts-agricultural.md; D-498, D-499",
   },
   "Beasts Ász (agricultural)": {
@@ -240,7 +240,7 @@ export const CATALOGUE = {
   "Forestfolk VII": {
     stages: ["Poacher", "Ranger"], adjective: "Wily",
     refine: { at: "Guild", prices: [9], gives: ["Ranger: Disguise: when played, it counts as a Forestfolk Alsó for the trick."] },
-    adj: { at: "Magistrates", price: 4, gives: "Tracking: shows other caravans off the highway (no other caravans in this build)." },
+    adj: { at: "Magistrates", price: 4, gives: "Tracking: shows other caravans off the highway." },
     source: "docs/cards/zold.md",
   },
   "Forestfolk VIII": {
@@ -405,7 +405,7 @@ export const CATALOGUE = {
   },
   "Fisherfolk IX": {
     stages: ["Travel Pass", "Fisherman's Papers"], adjective: "Fanciful",
-    refine: { at: "Magistrates", prices: [5], gives: ["Fisherman's Papers: Expedited Inspection (checkpoint cargo requirements count as met) and Local Support (+1 military where Fisherfolk live). (Personal deck.)"] },
+    refine: { at: "Magistrates", prices: [5], gives: ["Fisherman's Papers: Expedited Inspection (requirements not met: a 25% chance the guards wave the cargo demand through, D-946) and Local Support (+1 military where Fisherfolk live). (Personal deck.)"] },
     adj: { at: "Magistrates", price: 5, gives: "I Once Caught a Bigger One!: 50% a Fisherfolk VIII in the trick becomes a Fisherfolk X." },
     source: "docs/cards/fisherfolk.md; D-619, D-656, D-742",
   },
@@ -423,7 +423,7 @@ export const CATALOGUE = {
   },
   "Fisherfolk VIII Reeds": {
     stages: ["Reeds", "Reed Bundles", "Reed Mat"], adjective: "Woven", alt: true,
-    refine: { at: "Magistrates", prices: [7, 3], gives: ["Reed Bundles: Privacy Screen: other caravans can't inspect your cargo (none in this build).", "Reed Mat: nor by abilities."] },
+    refine: { at: "Magistrates", prices: [7, 3], gives: ["Reed Bundles: Privacy Screen: other caravans can't inspect your cargo.", "Reed Mat: nor by abilities."] },
     adj: { at: "Guild", price: 4, gives: "Coverup: abilities aimed at the card to match hit this card instead." },
     source: "docs/cards/commodity-alternatives.md; D-576, D-577",
   },
@@ -475,7 +475,7 @@ export const CATALOGUE = {
     stages: ["Amber", "Cabochon", "Amulet"], adjective: "Coveted",
     refine: { at: "Guild", prices: [46, 48], gives: ["Cabochon: worth more; Gilded Bait: when played, coins equal to its value go to the side that takes the trick.",
                                                    "Amulet: Gilded Bait pays twice its value."] },
-    adj: { at: "Magistrates", price: 1, gives: "Bribery: in cargo, buys 10% / 20% / 30% concealment at the checkpoint for 4 / 6 / 8 coins (Amber / Cabochon / Amulet; two at most), and lets you bribe inspectors and requirements [provisional values]." },
+    adj: { at: "Magistrates", price: 1, gives: "Bribery: in cargo, buys 10% / 20% / 30% concealment, or 1 / 2 / 3 military, at the checkpoint for 4 / 6 / 8 coins (Amber / Cabochon / Amulet; two at most), and lets you bribe inspectors and requirements [provisional values]." },
     source: "docs/cards/tok.md; D-651",
   },
   "Tradesfolk Alsó": {
@@ -492,7 +492,7 @@ export const CATALOGUE = {
   },
   "Tradesfolk Király": {
     stages: ["Guildmaster", "Magnate"], adjective: "Ruthless",
-    refine: { at: "Guild", prices: [4], gives: ["Hostile Takeover: acts as a Seven when you're richer than every other caravan (not yet working: no other caravans in this build)."] },
+    refine: { at: "Guild", prices: [4], gives: ["Hostile Takeover: acts as a Seven when you're richer than every other caravan."] },
     adj: { at: "Magistrates", price: 6, gives: "Hired Swords: while in your personal deck, +2 Sevens of military on the road and at checkpoints." },
     source: "docs/cards/tok.md",
   },
@@ -530,7 +530,7 @@ export const CATALOGUE = {
   },
   "Plainsfolk Alsó": {
     stages: ["Herdhand", "Gulyás"], adjective: "Dusty",
-    refine: { at: "Guild", prices: [5], gives: ["Gulyás: Roundup: when played, every VIII and X in the trick gathers beneath it (the bottom card and the claimed card stay)."] },
+    refine: { at: "Guild", prices: [5], gives: ["Gulyás: Roundup: when played, every VIII and X in the trick gathers beneath it (the card to match stays put)."] },
     adj: { at: "Magistrates", price: 30, gives: "Herd Growth: while in your personal deck, 50% per journey for a Plainsfolk VIII in cargo." },
     source: "docs/cards/plainsfolk.md; D-656",
   },
@@ -549,7 +549,7 @@ export const CATALOGUE = {
   "Plainsfolk Ász": {
     stages: ["Outlaw", "Fugitive", "Betyár"], adjective: "Notorious",
     refine: { at: "Guild", prices: [9, 14], gives: ["Fugitive: Great Escape: if the other side takes the trick, it returns to your hand (once per encounter).", "Betyár: returns whoever takes the trick."] },
-    adj: { at: "Magistrates", price: 12, gives: "Saddlebag Raid: steals a cargo card from an opposing caravan (not yet working: no other caravans in this build)." },
+    adj: { at: "Magistrates", price: 12, gives: "Saddlebag Raid: steals a cargo card from an opposing caravan." },
     source: "docs/cards/plainsfolk.md; D-652, D-357",
   },
   // ---- the Townsfolk suit (urban.md; tracks: valuation/classification.csv; acquisition D-297, D-303, D-620; DRAFT prices)
@@ -574,13 +574,13 @@ export const CATALOGUE = {
   "Townsfolk X": {
     stages: ["Bottled Wine", "Fine Wine", "Spiced Wine"], adjective: "Heady",
     refine: { at: "Guild", prices: [8, 10], gives: ["Fine Wine: Lost Socks: you and your partner swap a random encounter card (once per encounter).", "Spiced Wine: all four players pass one on, nobody keeps their own."] },
-    adj: { at: "Guild", price: 4, gives: "Nose for Wealth: shows which caravan carries the richest cargo (not yet working: no other caravans in this build)." },
+    adj: { at: "Guild", price: 4, gives: "Nose for Wealth: shows which caravan carries the richest cargo." },
     source: "docs/cards/urban.md; D-524",
   },
   "Townsfolk Alsó": {
     stages: ["Barmaid", "Tavern Keeper"], adjective: "Sharp",
     refine: { at: "Guild", prices: [5], gives: ["Tavern Keeper: Another Round!: the next player must play an extra card into the trick (once per encounter)."] },
-    adj: { at: "Guild", price: 4, gives: "Tavern Gossip: inspecting another caravan shows its cargo by rank (not yet working: no other caravans in this build)." },
+    adj: { at: "Guild", price: 4, gives: "Tavern Gossip: inspecting another caravan shows its cargo by rank." },
     source: "docs/cards/urban.md",
   },
   "Townsfolk Felső": {
@@ -665,7 +665,7 @@ export const CATALOGUE = {
   },
   "Bandits IX": {
     stages: ["Travel Pass", "False Identity"], adjective: "Convincing",
-    refine: { at: "Magistrates", prices: [10], gives: ["False Manifest: Bandits VIII in cargo give double concealment (personal deck). False Identity (not yet working: no other caravans)."] },
+    refine: { at: "Magistrates", prices: [10], gives: ["False Manifest: Bandits VIII in cargo give double concealment (personal deck). False Identity: departs a POI last, whatever the result."] },
     adj: { at: "Magistrates", price: 4, gives: "Identity Theft: when played, it becomes an exact copy of the card beneath it for the trick, abilities included." },
     source: "docs/cards/thug.md; D-257, D-619, D-620",
   },
@@ -696,7 +696,7 @@ export const CATALOGUE = {
   "Bandits Ász": {
     stages: ["Thief", "Robber", "Zsivány"], adjective: "Brazen",
     refine: { at: "Guild", prices: [17, 51], gives: ["Robber: Theft: every player loses a random hand card into the trick (once per encounter).", "Zsivány: 25% to be paid their combined value."] },
-    adj: { at: "Magistrates", price: 1, gives: "Checkpoint Bribery: opens checkpoint bribes and buys 10 / 20 / 30% concealment there by stage (cargo or personal deck) [provisional]." },
+    adj: { at: "Magistrates", price: 1, gives: "Checkpoint Bribery: opens checkpoint bribes and buys 10 / 20 / 30% concealment, or 1 / 2 / 3 military, there by stage (cargo or personal deck) [provisional]." },
     source: "docs/cards/thug.md; D-334, D-673, D-674, D-737",
   },
   // ---- the Beasts suit (wild.md; tracks D-651 and classification.csv; acquisition D-297, D-620; DRAFT prices)
@@ -714,7 +714,7 @@ export const CATALOGUE = {
   },
   "Beasts IX": {
     stages: ["Travel Papers (Woodland)", "Treebark"], adjective: "Odd-Smelling",
-    refine: { at: "Magistrates", prices: [21], gives: ["Wild Stench: each Beasts face card you carry lowers suspicion by 1 (personal deck). Game Trails (not yet working: the maps have no alternative roads)."] },
+    refine: { at: "Magistrates", prices: [21], gives: ["Wild Stench: each Beasts face card you carry lowers suspicion by 1 (personal deck). Game Trails: when departing, move sideways to another stop with the same stop number."] },
     adj: { at: "Magistrates", price: [1, 16], gives: "Smelly Treebark: when played, 50% for a random Beasts card in the trick above it, for you." },
     source: "docs/cards/wild.md; D-256, D-276, D-420, D-619, D-620",
   },
@@ -732,7 +732,7 @@ export const CATALOGUE = {
   },
   "Beasts Felső": {
     stages: ["Lynx", "Phantom"], adjective: "Solitary",
-    refine: { at: "Guild", prices: [11], gives: ["Phantom: Stalking: marks a card in the trick; it advances one refinement stage when the trick is taken."] },
+    refine: { at: "Guild", prices: [11], gives: ["Phantom: Stalking: marks a card in the trick; when a side takes the trick, it gains one random upgrade it can still take (its next stage or its adjective)."] },
     adj: { at: "Magistrates", price: 8, gives: "Solitary Hunter: in cargo, as your only Beasts Felső, it lowers suspicion by 3." },
     source: "docs/cards/wild.md; D-486",
   },
@@ -781,7 +781,7 @@ export const CATALOGUE = {
   },
   "King's Men Felső": {
     stages: ["Squire", "Knight"], adjective: "Aspiring",
-    refine: { at: "Guild", prices: [3], gives: ["Knight: Knight's Authority: a Conscript on his side keeps its claim even against a Seven."] },
+    refine: { at: "Guild", prices: [3], gives: ["Knight: Knight's Authority: a Farmfolk Conscript on his side claims despite an earlier Seven (a later Seven still overrides it, D-196)."] },
     adj: { at: "Magistrates", price: 1, gives: "Ransom: in cargo, coins for each road fight you win [provisional amount]." },
     source: "docs/cards/royal.md",
   },
@@ -813,9 +813,9 @@ export const CATALOGUE = {
   },
   "Clergy X": {
     stages: ["Scriptures", "Illuminated Manuscripts", "Sacred Tome"], adjective: "Revered",
-    refine: { at: "Magistrates", prices: [8, 10], gives: ["Illuminated Manuscripts: Proselytising: your Evangelists' Conversion turns one more face card.",
-                                                        "Sacred Tome: Conversion turns two more."] },
-    adj: { at: "Guild", price: 1, gives: "Sacred Teachings: while in your personal deck, Patronage pays more." },
+    refine: { at: "Magistrates", prices: [8, 10], gives: ["Illuminated Manuscripts: Proselytising: your Evangelists' Conversion turns one more face card; it also lifts an Oracle's Checkpoint Influence to 20% (D-558).",
+                                                        "Sacred Tome: Conversion turns two more; the Oracle's support as before."] },
+    adj: { at: "Guild", price: 1, gives: "Sacred Teachings: while in your personal deck, Patronage and Clergy Ász income (Alms) pay more (D-384, D-656)." },
     source: "docs/cards/piros.md; D-303, D-384, D-558, D-656",
   },
   "Clergy Alsó": {
@@ -835,6 +835,20 @@ export const CATALOGUE = {
     refine: { at: "Guild", prices: [7], gives: ["Ecclesiastical Authority: with three other Clergy cards in the trick, the Archbishop takes it, and nothing played after overturns that (even retroactively)."] },
     adj: { at: "Magistrates", price: 6, gives: "Holy Host: while in your personal deck, each Clergy Alsó, Felső and Király in your cargo counts as half a Seven of military." },
     source: "docs/cards/piros.md; D-650",
+  },
+  // the alternative Clergy face cards (D-565 to D-569; built D-1192); prices DRAFT, as their main-line counterparts
+  "Clergy Ász Drifter": {
+    stages: ["Drifter", "Wayfarer", "Good Samaritan"], adjective: "Selfless", alt: true,
+    refine: { at: "Guild", prices: [9, 14], gives: ["Wayfarer: Pay It Forward: when it qualifies for a claim, the next card your side plays this trick takes the claim when played, even if an opponent took it in between.",
+                                                  "Good Samaritan: and if an opponent stole that claim, their hand is filled with random basic VIII commodities (a hand clog; unplayed ones are discarded)."] },
+    adj: { at: "Magistrates", price: 9, gives: "Alms: in your personal deck, on arriving at a settlement: Drifter 20% for 5 coins, Wayfarer 40% for 8, Good Samaritan 50% for 10 (Sacred Teachings adds)." },
+    source: "docs/cards/piros.md; D-565 to D-567",
+  },
+  "Clergy Alsó Parchmenter": {
+    stages: ["Parchmenter", "Scribe"], adjective: "Meticulous", alt: true,
+    refine: { at: "Guild", prices: [2], gives: ["Scribe: Transcription: played on another card, a basic copy of it comes to your hand for this match (not when the Scribe leads)."] },
+    adj: { at: "Magistrates", price: 20, gives: "Scriptoria: in your personal deck, each journey 50% to turn 1 basic Forestfolk Hides in cargo into basic Clergy Parchment; the Scribe adds 5% to turn 1 Fine Vellum into basic Scriptures." },
+    source: "docs/cards/piros.md; D-568, D-569",
   },
   "Clergy Ász": {
     stages: ["Priestess", "Holywoman", "Oracle"], adjective: "Radiant",
@@ -873,7 +887,7 @@ export const CATALOGUE = {
   },
   "Farmfolk Felső": {
     stages: ["Husbandman", "Improver"], adjective: "Wise",
-    refine: { at: "Guild", prices: [29], gives: ["Quality Improvement: improves a Farmfolk good in the trick by one value tier (not yet working: tier values undefined, V8-01)."] },
+    refine: { at: "Guild", prices: [29], gives: ["Quality Improvement: improves a Farmfolk good in the trick by one value tier."] },
     adj: { at: "Magistrates", price: 36, gives: "Field Research: while in your personal deck, every journey along a non-highway road finds an upgraded Farmfolk VIII (rarely a Farmfolk X)." },
     source: "docs/cards/makk.md; D-382, D-387, D-651",
   },
@@ -885,8 +899,8 @@ export const CATALOGUE = {
   },
   "Farmfolk Ász": {
     stages: ["Sheep", "Silken-Fleeced Lamb", "Golden-Fleeced Lamb"], adjective: "Magnificent",
-    refine: { at: "Guild", prices: [9, 11], gives: ["Silken-Fleeced Lamb: worth more; Sticky Fleece (not yet working: bundle values undefined).",
-                                                   "Golden-Fleeced Lamb: worth much more; Sticky Fleece without the bundle suspicion (not yet working)."] },
+    refine: { at: "Guild", prices: [9, 11], gives: ["Silken-Fleeced Lamb: worth more; Sticky Fleece.",
+                                                   "Golden-Fleeced Lamb: worth much more; Sticky Fleece without the bundle suspicion."] },
     adj: { at: "Guild", price: 1, gives: "Travelling Spectacle: while in your personal deck, income at every settlement (more for a Golden-Fleeced Lamb); at most two sheep count." },
     source: "docs/cards/makk.md; D-303, D-651",
   },
@@ -908,7 +922,9 @@ export const entry = (c) => {
   if (!c.roster || c.roster === "main") return CATALOGUE[key(c)] || null;
   if (c.roster === "rural roster") return CATALOGUE[`${key(c)} (rural)`] || null;
   if (c.roster === "agricultural roster") return CATALOGUE[`${key(c)} (agricultural)`] || null;
-  const e = CATALOGUE[`${key(c)} ${lineBase(c)}`];
+  let e = CATALOGUE[`${key(c)} ${lineBase(c)}`];
+  // alternative face cards have no commodity stages: their line is found by stage name (D-1192)
+  if (!e && c.name) for (const [k, v] of Object.entries(CATALOGUE)) if (v.alt && k.startsWith(key(c) + " ") && v.stages.some((st) => c.name === st || c.name.endsWith(" " + st))) { e = v; break; }
   return e && e.alt ? e : null;
 };
 
@@ -936,4 +952,4 @@ export function apply(c, track) {
   c.name = upgradedName(c);
 }
 
-export const CHURCH_NOTE = "The Church sells Attrition blessings only (D-302). Not available yet: Attrition prices are undefined (SET-10) and parts of the Attrition rules are still open.";
+export const CHURCH_NOTE = "The Church sells Attrition blessings (D-302; test price) and identifies glitched Corruption cards (D-726, D-751).";
